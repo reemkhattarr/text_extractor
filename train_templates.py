@@ -3,6 +3,7 @@ import argparse
 import os
 import string
 import numpy as np
+import time
 import tkinter as tk
 from tkinter import filedialog
 from pathlib import Path
@@ -33,6 +34,7 @@ class TemplateTrainer:
 
         # State
         self.pdf_doc = None
+        self.last_smart_select_time = 0 # Debounce
         self.pdf_path = None
         self.current_page = 0
         self.total_pages = 0
@@ -65,33 +67,92 @@ class TemplateTrainer:
         self.header_height = 60
         self.min_height = 800
         self.input_char = "" # Buffer for text box input
-        self.selection_mode = "RECT" # "RECT" or "SELECT"        
+        self.selection_mode = "RECT" # "RECT" or "SELECT"
+        
+        # Cursor State
+        self.cursor_visible = True
+        self.last_blink_time = 0
+        
         # Mouse Callback
         cv2.namedWindow(self.window_name)
         cv2.setMouseCallback(self.window_name, self.mouse_callback)
 
+# ... inside draw_sidebar ...
+
+        # --- Input Box Logic ---
+        input_y_start = 120
+        
+        if self.confirmed_rect:
+            # Active Input Box
+            box_x, box_y = 20, 110
+            box_w, box_h = 260, 40
+            
+            # Highlight Box
+            cv2.rectangle(canvas, (box_x, box_y), (box_x+box_w, box_y+box_h), (255, 255, 255), -1)
+            cv2.rectangle(canvas, (box_x, box_y), (box_x+box_w, box_y+box_h), (0, 0, 0), 2)
+            
+            # Blink Cursor
+            import time
+            current_time = time.time()
+            if current_time - self.last_blink_time > 0.5: # Blink every 500ms
+                self.cursor_visible = not self.cursor_visible
+                self.last_blink_time = current_time
+            
+            cursor_char = "|" if self.cursor_visible else " "
+            
+            # Text Cursor/Content
+            prompt = f"Key: {self.input_char}{cursor_char}" 
+            cv2.putText(canvas, prompt, (box_x + 10, box_y + 28), font, 0.6, (0, 0, 0), 1)
+            cv2.putText(canvas, "Type A-Z, 0-9, then ENTER", (box_x, box_y + 60), font, 0.4, (100, 100, 100), 1)
+            
+            input_y_start = 190 # Push lists down
+        else:
+            self.cursor_visible = True # Reset when not active
+
+
+
     def predict_char(self, roi):
-        """Uses Tesseract to predict the character in the ROI."""
+        """Uses Tesseract to predict the character in the ROI, checking multiple rotations."""
         if not PYTESSERACT_AVAILABLE or roi is None or roi.size == 0:
             return ""
             
+        # Preprocess for better OCR
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        # PSM 10 = Treat the image as a single character
+        config = '--psm 10 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+        
+        best_char = ""
+        
+        # 0 degrees
         try:
-            # Preprocess for better OCR
-            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-            # Thresholding often helps Tesseract
-            _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            
-            # PSM 10 = Treat the image as a single character
-            config = '--psm 10 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-            text = pytesseract.image_to_string(thresh, config=config)
-            
-            # Clean up
-            clean_text = text.strip().upper()
-            if len(clean_text) > 0:
-                print(f"OCR Prediction: {clean_text[0]}")
-                return clean_text[0]
-        except Exception as e:
-            print(f"OCR Error: {e}")
+             text = pytesseract.image_to_string(thresh, config=config)
+             char = text.strip().upper()
+             if len(char) == 1 and (char.isalnum()):
+                 # If valid upright, prefer it immediately, unless we want to be super robust?
+                 # Usually if upright is recognizable, it's correct.
+                 print(f"OCR Prediction (0 deg): {char}")
+                 return char
+        except: pass
+
+        # Check Rotations: 90 (CW), 180, 270 (CCW)
+        # 90 deg = Rotate 90 CW (which is ROTATE_90_CLOCKWISE)
+        rotations = [
+            (cv2.ROTATE_90_CLOCKWISE, "90 deg"),
+            (cv2.ROTATE_180, "180 deg"),
+            (cv2.ROTATE_90_COUNTERCLOCKWISE, "270 deg")
+        ]
+        
+        for rot_code, label in rotations:
+            try:
+                rotated = cv2.rotate(thresh, rot_code)
+                text = pytesseract.image_to_string(rotated, config=config)
+                char = text.strip().upper()
+                if len(char) == 1 and (char.isalnum()):
+                    print(f"OCR Prediction ({label}): {char}")
+                    return char
+            except: pass
             
         return ""
 
@@ -220,36 +281,54 @@ class TemplateTrainer:
                  print("No dark pixel found nearby.")
                  return
         
-        # 2. Flood Fill
-        mask = np.zeros((h+2, w+2), np.uint8)
-        loDiff = (30, 30, 30)
-        upDiff = (30, 30, 30)
-        flags = 4 | (255 << 8) | cv2.FLOODFILL_MASK_ONLY | cv2.FLOODFILL_FIXED_RANGE
+        # 2. Flood Fill with Retry Logic
+        tolerances = [10, 15, 20, 30, 40]
+        found_selection = False
         
-        try:
-             retval, _, mask, rect = cv2.floodFill(
-                self.original_page_img, 
-                mask, 
-                target, 
-                newVal=(255, 0, 0), # ignored for mask only
-                loDiff=loDiff, 
-                upDiff=upDiff, 
-                flags=flags
-            )
+        for tol in tolerances:
+            mask = np.zeros((h+2, w+2), np.uint8)
+            loDiff = (tol, tol, tol)
+            upDiff = (tol, tol, tol)
+            flags = 4 | (255 << 8) | cv2.FLOODFILL_MASK_ONLY | cv2.FLOODFILL_FIXED_RANGE
+            
+            try:
+                 retval, _, mask, rect = cv2.floodFill(
+                    self.original_page_img, 
+                    mask, 
+                    target, 
+                    newVal=(255, 0, 0), # ignored for mask only
+                    loDiff=loDiff, 
+                    upDiff=upDiff, 
+                    flags=flags
+                )
+                 
+                 if rect[2] > 2 and rect[3] > 2:
+                     # Expand slightly to capture edges (user allowed padding)
+                     rx, ry, rw, rh = rect
+                     pad = 2
+                     nx = max(0, rx - pad)
+                     ny = max(0, ry - pad)
+                     nw = rw + (rx - nx) + pad # add left delta + right pad
+                     nh = rh + (ry - ny) + pad
+                     
+                     self.confirmed_rect = (nx, ny, nw, nh)
+                     print(f"Smart Selected (Tol {tol}): {self.confirmed_rect}")
+                     
+                     # Autosuggest using PADDED rect
+                     roi = self.original_page_img[ny:ny+nh, nx:nx+nw]
+                     self.input_char = self.predict_char(roi)
+                     
+                     found_selection = True
+                     break # Stop if we found a good one
+                     
+            except Exception as e:
+                print(f"Flood fill failed at tol {tol}: {e}")
+                
+        if not found_selection:
+             print("Selection too small (try clicking darker center or check zoom).")
              
-             if rect[2] > 2 and rect[3] > 2:
-                 self.confirmed_rect = rect
-                 print(f"Smart Selected: {rect}")
-                 
-                 # Autosuggest
-                 rx, ry, rw, rh = rect
-                 roi = self.original_page_img[ry:ry+rh, rx:rx+rw]
-                 self.input_char = self.predict_char(roi)
-                 
-             else:
-                 print("Selection too small.")
-        except Exception as e:
-            print(f"Flood fill failed: {e}")
+        self.last_smart_select_time = time.time()
+
 
     def mouse_callback(self, event, x, y, flags, param):
         # 1. UI Buttons
@@ -274,6 +353,15 @@ class TemplateTrainer:
                  if 20 <= x <= 180 and 80 <= y <= 95: # Click area
                      if self.selection_mode == "RECT": self.selection_mode = "SELECT"
                      else: self.selection_mode = "RECT"
+                     
+                     # Clear selection on mode switch
+                     self.confirmed_rect = None
+                     self.input_char = ""
+                     self.selection_start = None
+                     self.selection_current = None
+                     self.selecting = False
+                     print("Selection cleared due to mode switch.")
+                     
                      print(f"Mode switched to {self.selection_mode}")
                      return
         
@@ -353,9 +441,19 @@ class TemplateTrainer:
                                     self.input_char = self.predict_char(roi)
 
                 elif self.selection_mode == "SELECT":
-                    if not self.is_panning and not self.confirmed_rect:
-                        img_pos = self.screen_to_image(vx, vy)
-                        self.do_smart_selection(img_pos[0], img_pos[1])
+                    if not self.is_panning:
+                         # Debounce: Ignore clicks too close to last processing end
+                         if time.time() - self.last_smart_select_time < 0.5:
+                             return
+
+                         # Discard previous if exists (User requested no auto-save)
+                         if self.confirmed_rect:
+                             self.confirmed_rect = None
+                             self.input_char = ""
+                             
+                         # Start new selection
+                         img_pos = self.screen_to_image(vx, vy)
+                         self.do_smart_selection(img_pos[0], img_pos[1])
 
     def change_page(self, delta):
         if not self.pdf_doc: return
@@ -397,13 +495,23 @@ class TemplateTrainer:
             cv2.rectangle(canvas, (box_x, box_y), (box_x+box_w, box_y+box_h), (255, 255, 255), -1)
             cv2.rectangle(canvas, (box_x, box_y), (box_x+box_w, box_y+box_h), (0, 0, 0), 2)
             
+            # Blink Cursor
+            import time
+            current_time = time.time()
+            if current_time - self.last_blink_time > 0.5: # Blink every 500ms
+                self.cursor_visible = not self.cursor_visible
+                self.last_blink_time = current_time
+            
+            cursor_char = "|" if self.cursor_visible else " "
+            
             # Text Cursor/Content
-            prompt = f"Key: {self.input_char}|" 
+            prompt = f"Key: {self.input_char}{cursor_char}" 
             cv2.putText(canvas, prompt, (box_x + 10, box_y + 28), font, 0.6, (0, 0, 0), 1)
             cv2.putText(canvas, "Type A-Z, 0-9, then ENTER", (box_x, box_y + 60), font, 0.4, (100, 100, 100), 1)
             
             input_y_start = 190 # Push lists down
         else:
+            self.cursor_visible = True # Reset
             pass
 
         # Lists
@@ -536,7 +644,7 @@ class TemplateTrainer:
         return self.canvas
 
     def save_template(self, char_key):
-        if not self.confirmed_rect: return
+        if not self.confirmed_rect or not char_key: return
             
         print(f"Saving template for '{char_key}'...")
         rx, ry, rw, rh = self.confirmed_rect
@@ -583,11 +691,15 @@ class TemplateTrainer:
             cv2.imshow(self.window_name, ui)
             key = cv2.waitKey(20) & 0xFF
             
-            if key == 27:
+            if key == 27: # Esc
                 if self.confirmed_rect:
                     self.confirmed_rect = None
                     self.input_char = ""
-                else: break
+                    print("Selection cleared.")
+                elif self.selecting:
+                     self.selecting = False
+                else: 
+                     break
             
             elif key == 13: # Enter
                 if self.confirmed_rect:
