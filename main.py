@@ -10,7 +10,7 @@ from grouper import group_characters
 
 def main():
     parser = argparse.ArgumentParser(description="Extract reference designators from PCB images.")
-    parser.add_argument("image_path", help="Path to the PCB layout image")
+    parser.add_argument("image_path", nargs="?", help="Path to the PCB layout image")
     parser.add_argument("--templates", help="Path to template directory", default="templates")
     parser.add_argument("--font", help="Path to font file for template generation", default=None)
     parser.add_argument("--zoom", help="Zoom factor for PDF rendering (detection)", type=float, default=6.0)
@@ -18,8 +18,100 @@ def main():
     parser.add_argument("--page", help="Specific page number to process (1-based)", type=int, default=None)
     args = parser.parse_args()
 
+    # 0. Interactive Template Selection (if not using font gen)
+    # The user asked to choose the template (placement or schematics)
+    template_dir = args.templates
+    if not args.font:
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            
+            def ask_template_mode_main():
+                """Shows a startup dialog to choose the template directory."""
+                try:
+                    root = tk.Tk()
+                    root.title("Select Template Type")
+                    
+                    # Center the window
+                    w, h = 350, 200
+                    sw = root.winfo_screenwidth()
+                    sh = root.winfo_screenheight()
+                    x = (sw - w) // 2
+                    y = (sh - h) // 2
+                    root.geometry(f"{w}x{h}+{x}+{y}")
+                    
+                    # Style
+                    root.configure(bg="#2d2d30")
+                    
+                    choice = tk.StringVar(value="")
+                    
+                    def set_placement():
+                        choice.set("placement_templates")
+                        root.destroy()
+                        
+                    def set_schematic():
+                        choice.set("schematics_templates")
+                        root.destroy()
+                        
+                    def create_btn(text, cmd):
+                        btn = tk.Button(root, text=text, command=cmd, 
+                                        font=("Segoe UI", 11), 
+                                        bg="#007acc", fg="white", 
+                                        activebackground="#005f9e", activeforeground="white",
+                                        relief="flat", padx=20, pady=10, cursor="hand2")
+                        btn.pack(pady=10, fill="x", padx=40)
+                        return btn
+                        
+                    tk.Label(root, text="Select Template Mode", font=("Segoe UI", 14, "bold"), bg="#2d2d30", fg="white").pack(pady=(20, 10))
+                    
+                    create_btn("Placement Templates", set_placement)
+                    create_btn("Schematics Templates", set_schematic)
+                    
+                    # Handle window close
+                    def on_closing():
+                        choice.set("exit")
+                        root.destroy()
+                        
+                    root.protocol("WM_DELETE_WINDOW", on_closing)
+                    
+                    root.mainloop()
+                    return choice.get()
+                except Exception as e:
+                    print(f"Dialog error: {e}")
+                    return "exit"
+
+            selected_mode = ask_template_mode_main()
+            if selected_mode == "exit" or not selected_mode:
+                print("Exiting...")
+                return
+            
+            template_dir = selected_mode
+            print(f"Selected template directory: {template_dir}")
+
+            # 0.1 File Selection if not provided
+            if not args.image_path:
+                root = tk.Tk()
+                root.withdraw()
+                file_path = filedialog.askopenfilename(
+                    title="Select PDF or Image",
+                    filetypes=[("All Files", "*.*"), ("PDF Files", "*.pdf"), ("Images", "*.png;*.jpg;*.jpeg")]
+                )
+                root.destroy()
+                if file_path:
+                    args.image_path = file_path
+                else:
+                    print("No file selected. Exiting.")
+                    return
+
+        except ImportError:
+            pass
+            
+    if not args.image_path:
+        print("Error: No image_path provided.")
+        return
+
     print(f"Processing {args.image_path}...")
-    
+
     # 1. Load Templates
     tm = TemplateManager()
     if args.font:
@@ -28,8 +120,8 @@ def main():
         chars = string.ascii_uppercase + string.digits # Add more if needed
         tm.generate_templates_from_font(args.font, chars)
     else:
-        # Load from directory
-        tm.load_templates_from_dir(args.templates)
+        # Load from directory selected
+        tm.load_templates_from_dir(template_dir)
         
     if not tm.templates:
         print("No templates loaded. Use --font or populate templates directory.")
@@ -143,6 +235,8 @@ def main():
                 if high_res_img is not None:
                     # Convert to grayscale immediately to save space
                     high_res_img = cv2.cvtColor(high_res_img, cv2.COLOR_BGR2GRAY)
+                    # Sharpen / Binarize to match template quality
+                    _, high_res_img = cv2.threshold(high_res_img, 180, 255, cv2.THRESH_BINARY)
                     zoom_ratio = args.capture_zoom / args.zoom
                     print("High-res page rendered.")
                 else:
