@@ -307,21 +307,36 @@ class TemplateTrainer:
                 except: pass
         
         if count == 0:
-             return 5, 8, 200, 200
+             return 5, 200, 20 # defaults: min, max, strict_min_long_side
              
-        # Apply Logic
-        # Max: Largest dimension * scale * 2.0 (+100%)
-        # Min: Smallest dimension * scale * 0.9 (-10%)
-        
+        # Apply Logic for Max Size
         limit_max = int(max_dim * scale_ratio * 2.0)
-        limit_min = int(min_dim * scale_ratio * 0.9)
+        limit_max = max(limit_max, 20)
         
-        # Safety bounds
-        limit_max = max(limit_max, 20) 
-        limit_min = max(limit_min, 4) # Raised floor slightly from 2 to 4 for visibility
+        # Apply Logic for Min Size
+        # We want to be careful not to exclude "1" or "-" which have one small dimension.
+        # So we don't return a strict min_w/min_h that would exclude them.
+        # Instead, we define a "Min Longest Side".
+        # For "1" (10x50), Longest=50. For Hole (20x25), Longest=25.
         
-        print(f"Dynamic Limits (Ratio {scale_ratio:.2f}): Min {limit_min}px, Max {limit_max}px")
-        return limit_min, limit_min, limit_max, limit_max
+        # Calculate min of max_dims
+        min_longest_side = 1000
+        for f in os.listdir(self.output_dir):
+            if f.endswith(".png"):
+                try:
+                    img = cv2.imread(os.path.join(self.output_dir, f), cv2.IMREAD_GRAYSCALE)
+                    if img is not None:
+                        h, w = img.shape[:2]
+                        min_longest_side = min(min_longest_side, max(w, h))
+                except: pass
+        
+        strict_min_limit = int(min_longest_side * scale_ratio * 0.9)
+        strict_min_limit = max(strict_min_limit, 5)
+
+        print(f"Dynamic Limits (Ratio {scale_ratio:.2f}): Max {limit_max}px, Min Longest Side {strict_min_limit}px")
+        
+        # We return a loose min (5) for the API, but give the strict limit for manual filtering
+        return 5, limit_max, strict_min_limit
 
     def detect_session_templates(self):
         """
@@ -368,8 +383,17 @@ class TemplateTrainer:
             # Save debug just in case (optional, maybe remove in production)
             # cv2.imwrite("debug_train_binary.png", binary)
             
-            min_w, min_h, max_w, max_h = self.get_candidate_limits(scale_ratio=0.333)
-            candidates = get_character_candidates(binary, min_w=min_w, min_h=min_h, max_w=max_w, max_h=max_h)
+            loose_min, max_limit, strict_min = self.get_candidate_limits(scale_ratio=0.333)
+            # Use loose min for API to capture "1"s
+            candidates = get_character_candidates(binary, min_w=loose_min, min_h=loose_min, max_w=max_limit, max_h=max_limit)
+            
+            # Apply Strict Filter: Filter out items where BOTH dimensions are smaller than strict_min (actually max(w,h) < strict)
+            valid_candidates = []
+            for c in candidates:
+                if max(c['w'], c['h']) >= strict_min:
+                    valid_candidates.append(c)
+            candidates = valid_candidates
+            
             print(f"Propsoed Candidates: {len(candidates)}")
             
             matches = []
@@ -550,8 +574,12 @@ class TemplateTrainer:
                 line_len = max(40, int(8.0 * 10))
                 _, _, binary = preprocess_from_array(self.original_page_img, min_line_length=line_len)
                 
-                min_w, min_h, max_w, max_h = self.get_candidate_limits(scale_ratio=0.333)
-                self.page_candidates = get_character_candidates(binary, min_w=min_w, min_h=min_h, max_w=max_w, max_h=max_h)
+                loose_min, max_limit, strict_min = self.get_candidate_limits(scale_ratio=0.333)
+                raw_candidates = get_character_candidates(binary, min_w=loose_min, min_h=loose_min, max_w=max_limit, max_h=max_limit)
+                
+                # Apply Strict Filter
+                self.page_candidates = [c for c in raw_candidates if max(c['w'], c['h']) >= strict_min]
+                
                 print(f"Cached {len(self.page_candidates)} candidates.")
                 
                 if self.debug_page is not None and self.current_page == self.debug_page:
@@ -787,11 +815,11 @@ class TemplateTrainer:
                      # CHECK DIMENSIONS AGAINST LIMITS
                      try:
                          # Use ratio 0.333 assuming templates are Hi-Res (Zoom 24) vs User View (Zoom 8)
-                         # If no templates, this returns defaults (5, 8, 200, 200)
-                         min_w, min_h, _, _ = self.get_candidate_limits(scale_ratio=0.333)
+                         # If no templates, this returns defaults
+                         _, _, strict_min = self.get_candidate_limits(scale_ratio=0.333)
                          
-                         if nw < min_w or nh < min_h:
-                             # Too small
+                         # Check longest side
+                         if max(nw, nh) < strict_min:
                              continue
                      except:
                          pass

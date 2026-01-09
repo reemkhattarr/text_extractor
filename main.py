@@ -147,26 +147,26 @@ def main():
          if not args.font and args.capture_zoom and args.zoom:
              ratio = args.capture_zoom / args.zoom
          
-         # Expected sizes in detection image
-         expected_max_size = max_tmpl_dim / ratio
-         expected_min_size = min_tmpl_dim / ratio
+         min_longest_side = 1000
+         for t in tm.templates.values():
+             min_longest_side = min(min_longest_side, max(t.shape[:2]))
+             
+         expected_longest = min_longest_side / ratio
          
          # User filter: 
-         # Max: +100% (Factor 2.0)
-         # Min: Strict 100% (Factor 1.0) - Don't accept smaller than templates
          limit_max = int(expected_max_size * 2.0)
-         limit_min = int(expected_min_size * 0.9)
+         limit_strict_min = int(expected_longest * 0.9)
          
          # Safety floor
          limit_max = max(limit_max, 20)
-         limit_min = max(limit_min, 4)
+         limit_strict_min = max(limit_strict_min, 4)
          
          cand_max_w = limit_max
          cand_max_h = limit_max
-         cand_min_w = limit_min
-         cand_min_h = limit_min
+         cand_min_w = 5 # Loose for API
+         cand_min_h = 5 
          
-         print(f"Dynamic Candidate Size Limits: Min {limit_min}px, Max {limit_max}px (Ratio: {ratio:.2f})")
+         print(f"Dynamic Candidate Size Limits: Max {limit_max}px, Strict Min Longest {limit_strict_min}px")
 
 
     # 2. Process Image(s)
@@ -270,8 +270,16 @@ def main():
             continue
 
         # 3. Get Candidates
-        # 3. Get Candidates
-        candidates = get_character_candidates(binary_img, min_w=cand_min_w, min_h=cand_min_h, max_w=cand_max_w, max_h=cand_max_h)
+        raw_candidates = get_character_candidates(binary_img, min_w=cand_min_w, min_h=cand_min_h, max_w=cand_max_w, max_h=cand_max_h)
+        # Apply Strict Filter
+        candidates = []
+        if max_tmpl_dim > 0:
+            for c in raw_candidates:
+                if max(c['w'], c['h']) >= limit_strict_min:
+                    candidates.append(c)
+        else:
+            candidates = raw_candidates
+            
         print(f"Found {len(candidates)} candidate regions.")
         
         # Optimize PDF High-Res Extraction
