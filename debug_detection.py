@@ -27,7 +27,8 @@ def debug_candidates(pdf_path, page_num, zoom=6.0, templates_dir="templates"):
         return
 
     # 2. Preprocess (Same as main.py)
-    _, gray, binary = preprocess_from_array(img)
+    line_len = max(40, int(zoom * 10))
+    _, gray, binary = preprocess_from_array(img, min_line_length=line_len)
     
     # Save binary for inspection
     cv2.imwrite("debug_binary.png", binary)

@@ -28,9 +28,16 @@ except ImportError:
     PYTESSERACT_AVAILABLE = False
     print("pytesseract not found. Autosuggestion disabled.")
 
+try:
+    from image_processor import preprocess_from_array, get_character_candidates, extract_candidate_roi
+    from matcher import match_character
+except ImportError as e:
+    print(f"Warning: Could not import detection modules: {e}")
+
 class TemplateTrainer:
-    def __init__(self, output_dir="templates"):
+    def __init__(self, output_dir="templates", debug_page=None):
         self.output_dir = output_dir
+        self.debug_page = debug_page
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
 
@@ -53,6 +60,14 @@ class TemplateTrainer:
         self.is_panning = False
         self.pan_start = (0, 0)
         
+        # Right Viewport State (Stable)
+        # Right Viewport State (Stable)
+        self.right_view_scale = 1.0
+        self.right_view_offset_x = 0
+        self.right_view_offset_y = 0
+        self.is_panning_right = False
+        self.pan_start_right = (0, 0)
+        
         # Selection State
         self.selecting = False
         self.selection_start = None # (img_x, img_y) in IMAGE coordinates
@@ -68,6 +83,24 @@ class TemplateTrainer:
         self.editing_image = None # Image of the template being edited
         self.editing_char = None # The original char key (for renaming)
         self.delete_btn_rect = None # (x, y, w, h)
+        
+        # Detection State
+        self.detected_matches = [] # List of (x, y, w, h, label)
+        self.detection_full_img = None # Full resolution annotated image
+        self.is_processing = False
+        
+        # Real-time Detection State (Split View)
+        self.active_search_char = None
+        self.matched_instances = [] # List of (x, y, w, h)
+        self.page_candidates = [] # Cached list of ALL candidate rects for current page
+
+        # Detection Window Viewport (similar to main window)
+        self.det_scale = 1.0
+        self.det_offset_x = 0
+        self.det_offset_y = 0
+        self.det_panning = False
+        self.det_pan_start = (0, 0)
+        self.det_window_name = "Detected Matches"
         
         # Grid Coordinates Cache
         self.grid_coords = {} # char -> (x, y, w, h)
@@ -248,6 +281,203 @@ class TemplateTrainer:
         else:
             print("Failed to load PDF.")
 
+    def get_candidate_limits(self, scale_ratio=0.333):
+        """
+        Calculates dynamic min/max width/height for candidates based on existing templates.
+        scale_ratio: Ratio of Candidate Size / Template Size (Default 0.333 for Zoom 8 vs 24)
+        """
+        min_dim = 1000
+        max_dim = 0
+        
+        count = 0
+        if not os.path.exists(self.output_dir):
+            return 5, 8, 200, 200 # Defaults
+            
+        for f in os.listdir(self.output_dir):
+            if f.endswith(".png"):
+                try:
+                    path = os.path.join(self.output_dir, f)
+                    img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+                    if img is not None:
+                        h, w = img.shape[:2]
+                        # Track global min/max dimensions
+                        min_dim = min(min_dim, min(w, h))
+                        max_dim = max(max_dim, max(w, h))
+                        count += 1
+                except: pass
+        
+        if count == 0:
+             return 5, 8, 200, 200
+             
+        # Apply Logic
+        # Max: Largest dimension * scale * 2.0 (+100%)
+        # Min: Smallest dimension * scale * 0.9 (-10%)
+        
+        limit_max = int(max_dim * scale_ratio * 2.0)
+        limit_min = int(min_dim * scale_ratio * 0.9)
+        
+        # Safety bounds
+        limit_max = max(limit_max, 20) 
+        limit_min = max(limit_min, 4) # Raised floor slightly from 2 to 4 for visibility
+        
+        print(f"Dynamic Limits (Ratio {scale_ratio:.2f}): Min {limit_min}px, Max {limit_max}px")
+        return limit_min, limit_min, limit_max, limit_max
+
+    def detect_session_templates(self):
+        """
+        Detects characters on the current page using the candidate extraction + matching pipeline.
+        This mirrors the logic in debug_detection.py / main.py.
+        """
+        if self.original_page_img is None:
+            print("No image to process.")
+            return
+
+        # Ensure header list is up to date
+        self.refresh_file_list()
+        
+        if not self.existing_files:
+            print("No templates found in output directory.")
+            return
+
+        self.is_processing = True
+        self.detected_matches = []
+        print("Starting detection process using candidate extraction...")
+        
+        # 1. Load Templates
+        templates = {}
+        for file_key in self.existing_files:
+            path = os.path.join(self.output_dir, f"{file_key}.png")
+            if os.path.exists(path):
+                tmpl = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+                if tmpl is not None:
+                    display_char = file_key
+                    if file_key == "dot": display_char = "."
+                    if file_key == "slash": display_char = "/"
+                    templates[display_char] = tmpl
+        
+        if not templates:
+            self.is_processing = False
+            return
+
+        # 2. Preprocess & Get Candidates
+        # We reuse the robust pipeline from image_processor
+        try:
+            line_len = max(40, int(8.0 * 10))
+            _, gray, binary = preprocess_from_array(self.original_page_img, min_line_length=line_len)
+            
+            # Save debug just in case (optional, maybe remove in production)
+            # cv2.imwrite("debug_train_binary.png", binary)
+            
+            min_w, min_h, max_w, max_h = self.get_candidate_limits(scale_ratio=0.333)
+            candidates = get_character_candidates(binary, min_w=min_w, min_h=min_h, max_w=max_w, max_h=max_h)
+            print(f"Propsoed Candidates: {len(candidates)}")
+            
+            matches = []
+            
+            for cand in candidates:
+                roi = extract_candidate_roi(gray, cand)
+                
+                # Match against templates (handles 0-315 rotation now)
+                # We expect candidate (Zoom 8) to be ~0.33x of template (Zoom 24).
+                best_char, best_score = match_character(roi, templates, expected_scale=0.333)
+                
+                if best_score > 0.65: # Relaxed slightly from 0.70 to improve recall
+                    x, y, w, h = cand['bbox']
+                    matches.append((x, y, w, h, best_char))
+                    print(f"Match: {best_char} ({best_score:.2f}) at {x},{y}")
+            
+            self.detected_matches = matches
+            
+            # Prepare visualization image (Full Resolution)
+            vis_img = self.original_page_img.copy()
+            for (x, y, w, h, label) in matches:
+                cv2.rectangle(vis_img, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                cv2.putText(vis_img, label, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            
+            self.detection_full_img = vis_img
+            
+            # Initial Fit Calculation
+            vh, vw = vis_img.shape[:2]
+            win_w, win_h = 1000, 800 # Target window size
+            scale_w = win_w / vw
+            scale_h = win_h / vh
+            self.det_scale = min(scale_w, scale_h) * 0.95
+            
+            # Center
+            self.det_offset_x = (win_w - vw * self.det_scale) / 2
+            self.det_offset_y = (win_h - vh * self.det_scale) / 2
+            
+            # Create Window & Set Callback
+            cv2.namedWindow(self.det_window_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(self.det_window_name, win_w, win_h)
+            cv2.setMouseCallback(self.det_window_name, self.detection_mouse_callback)
+            
+        except Exception as e:
+            print(f"Detection error: {e}")
+            import traceback
+            traceback.print_exc()
+
+        self.is_processing = False
+        print(f"Detection complete. Found {len(self.detected_matches)} matches.")
+
+    def detection_mouse_callback(self, event, x, y, flags, param):
+        """Separate callback for the detection results window."""
+        if self.detection_full_img is None: return
+
+        # Pan
+        if event == cv2.EVENT_MBUTTONDOWN or (event == cv2.EVENT_RBUTTONDOWN):
+            self.det_panning = True
+            self.det_pan_start = (x, y)
+        
+        elif event == cv2.EVENT_MOUSEMOVE and self.det_panning:
+            dx = x - self.det_pan_start[0]
+            dy = y - self.det_pan_start[1]
+            self.det_offset_x += dx
+            self.det_offset_y += dy
+            self.det_pan_start = (x, y)
+        
+        elif event == cv2.EVENT_MBUTTONUP or (event == cv2.EVENT_RBUTTONUP):
+            self.det_panning = False
+        
+        # Zoom (Centered on mouse)
+        elif event == cv2.EVENT_MOUSEWHEEL:
+            zoom_factor = 1.1 if flags > 0 else 0.9
+            
+            # Current mouse pos in image coords
+            mx_img = (x - self.det_offset_x) / self.det_scale
+            my_img = (y - self.det_offset_y) / self.det_scale
+            
+            new_scale = self.det_scale * zoom_factor
+            new_scale = max(0.05, min(new_scale, 5.0)) # Limits
+            
+            # Adjust offset to keep mouse point stable
+            self.det_offset_x = x - mx_img * new_scale
+            self.det_offset_y = y - my_img * new_scale
+            self.det_scale = new_scale
+
+    def update_detection_view(self):
+        """Renders the Viewport for the detection window."""
+        if self.detection_full_img is None: return
+        
+        win_w, win_h = 1000, 800 # Fixed Viewport size for logic simplifiction
+        # (Note: In WINDOW_NORMAL user can resize, but we render to fixed buffer or need to query window size.
+        # Querying GetWindowRect in OpenCV is tricky cross-platform. 
+        # For simplicity, we assume fixed buffer size and let OpenCV stretch it if user resizes window,
+        # OR we just render to a large enough buffer. Let's use 1000x800 buffer.)
+        
+        canvas = np.zeros((win_h, win_w, 3), dtype=np.uint8)
+        canvas[:] = (30, 30, 30) # Dark BG
+        
+        M = np.float32([
+            [self.det_scale, 0, self.det_offset_x],
+            [0, self.det_scale, self.det_offset_y]
+        ])
+        
+        # WarpAffine handles clipping automatically
+        view = cv2.warpAffine(self.detection_full_img, M, (win_w, win_h), borderValue=(30, 30, 30))
+        
+        cv2.imshow(self.det_window_name, view)
+
     def update_page_render(self):
         if not self.pdf_doc:
             return
@@ -270,27 +500,126 @@ class TemplateTrainer:
         self.confirmed_rect = None
         self.rotation_angle = 0
         self.selection_start = None
+        self.detected_matches = []
+        self.show_detections = False
+        
+        # Reset Real-time Detection
+        self.active_search_char = None
+        self.matched_instances = []
+        self.page_candidates = []
+        
+        # Pre-compute candidates for this page to speed up interactive search
+        if self.original_page_img is not None:
+            if self.debug_page is not None and self.current_page == self.debug_page:
+                 # If debug page is set, we DO compute immediately to show debug info
+                self.ensure_candidates_computed()
+            else:
+                 self.page_candidates = [] # Lazy load
+                 print("Candidates cleared (Lazy Mode).")
         
         # Calc Zoom-to-Fit
         if self.original_page_img is not None:
             ph, pw = self.original_page_img.shape[:2]
             
-            # Viewport size (Approximate, simplified calc)
-            # We assume a standard window height or current window height if possible?
-            view_w = 1200 # Fixed canvas width
+            # Viewport size (Approximate, simplified calc for split view)
+            # We target ~800px width for the left viewport
+            view_w = 800 
             view_h = 900 - self.header_height
             
             scale_w = view_w / pw
             scale_h = view_h / ph
             
-            # Fit whole page
-            self.min_scale = min(scale_w, scale_h) * 0.95 # slightly smaller to ensure margin?
+            # Left Viewport (Interactive) - Fit initially
+            self.min_scale = min(scale_w, scale_h) * 0.95 
             self.view_scale = self.min_scale 
             
-            # Center it
-            # Offset = (ViewSize - ImageSize*Scale) / 2
+            # Center Left
             self.view_offset_x = (view_w - pw * self.view_scale) / 2
             self.view_offset_y = (view_h - ph * self.view_scale) / 2
+            
+            # Right Viewport (Stable) - Fit Always
+            self.right_view_scale = self.min_scale
+            self.right_view_offset_x = (view_w - pw * self.right_view_scale) / 2
+            self.right_view_offset_y = (view_h - ph * self.right_view_scale) / 2
+
+    def ensure_candidates_computed(self):
+        """Computes candidates for the current page if not already done."""
+        if not self.page_candidates and self.original_page_img is not None:
+             try:
+                print(f"Lazy-computing candidates for page {self.current_page+1}...")
+                line_len = max(40, int(8.0 * 10))
+                _, _, binary = preprocess_from_array(self.original_page_img, min_line_length=line_len)
+                
+                min_w, min_h, max_w, max_h = self.get_candidate_limits(scale_ratio=0.333)
+                self.page_candidates = get_character_candidates(binary, min_w=min_w, min_h=min_h, max_w=max_w, max_h=max_h)
+                print(f"Cached {len(self.page_candidates)} candidates.")
+                
+                if self.debug_page is not None and self.current_page == self.debug_page:
+                     vis_cand = self.original_page_img.copy()
+                     for cand in self.page_candidates:
+                        x, y, w, h = cand['bbox']
+                        cv2.rectangle(vis_cand, (x, y), (x+w, y+h), (0, 0, 255), 1)
+                     cv2.imwrite(f"debug_candidates_page_{self.current_page}.png", vis_cand)
+                     print(f"saved debug_candidates_page_{self.current_page}.png")
+
+             except Exception as e:
+                print(f"Error computing candidates: {e}")
+                self.page_candidates = []
+
+    def search_single_char(self, char_key):
+        """Runs detection for a single character on the current page."""
+        self.active_search_char = char_key
+        
+        # Ensure candidates exist
+        self.ensure_candidates_computed()
+        
+        # Filter existing matches for this char to avoid duplicates (Refresh logic)
+        self.matched_instances = [m for m in self.matched_instances if m[4] != char_key]
+        
+        if self.original_page_img is None: return
+        
+        # Load template
+        safe_char = char_key
+        if char_key == ".": safe_char = "dot"
+        if char_key == "/": safe_char = "slash"
+        path = os.path.join(self.output_dir, f"{safe_char}.png")
+        if not os.path.exists(path):
+            print(f"No template found for {char_key}")
+            return
+            
+        tmpl = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if tmpl is None: return
+        
+        templates = {char_key: tmpl}
+        
+        print(f"Searching for '{char_key}'...")
+        candidates = self.page_candidates
+        if not candidates: return
+        
+        gray = cv2.cvtColor(self.original_page_img, cv2.COLOR_BGR2GRAY)
+        
+        found_count = 0
+        
+        # DEBUG: Limit debugging to first 20 candidates roughly matching aspect to avoid flood
+        # But for now, we just rely on matcher's debug flag.
+        import time
+        debug_ts = int(time.time())
+        debug_dir = f"debug_search_{char_key}_{debug_ts}"
+        
+        print(f"DEBUG: Saving visualization to {debug_dir}")
+        
+        for i, cand in enumerate(candidates):
+            roi = extract_candidate_roi(gray, cand)
+            
+            # Use stricter threshold or same? Using 0.333 scale (Zoom 8 vs 24)
+            best_char, best_score = match_character(roi, templates, expected_scale=0.333)
+            
+            if best_char == char_key and best_score > 0.5:
+                 x, y, w, h = cand['bbox']
+                 self.matched_instances.append((x, y, w, h, char_key))
+                 found_count += 1
+        
+        print(f"Found {found_count} instances of '{char_key}'. Total cumulative: {len(self.matched_instances)}")
             
     def rotate_image(self, image, angle):
         """Rotates an image by a specific angle (degrees clockwise), expanding the canvas."""
@@ -353,7 +682,7 @@ class TemplateTrainer:
             y_max = max(y_max, y + h)
             
         # Pad slightly? Maybe 1px?
-        pad = 1
+        pad = 0
         h, w = img.shape[:2]
         x1 = max(0, int(x_min) - pad)
         y1 = max(0, int(y_min) - pad)
@@ -455,6 +784,18 @@ class TemplateTrainer:
                      nw = rw + (rx - nx) + pad # add left delta + right pad
                      nh = rh + (ry - ny) + pad
                      
+                     # CHECK DIMENSIONS AGAINST LIMITS
+                     try:
+                         # Use ratio 0.333 assuming templates are Hi-Res (Zoom 24) vs User View (Zoom 8)
+                         # If no templates, this returns defaults (5, 8, 200, 200)
+                         min_w, min_h, _, _ = self.get_candidate_limits(scale_ratio=0.333)
+                         
+                         if nw < min_w or nh < min_h:
+                             # Too small
+                             continue
+                     except:
+                         pass
+
                      self.confirmed_rect = (nx, ny, nw, nh)
                      print(f"Smart Selected (Tol {tol}): {self.confirmed_rect}")
                      
@@ -477,7 +818,6 @@ class TemplateTrainer:
     def mouse_callback(self, event, x, y, flags, param):
         # 1. Hover & Cursor Logic
         found_hover = None
-        # Check cached buttons
         for name, (bx, by, bw, bh) in self.ui_buttons.items():
             if bx <= x <= bx+bw and by <= y <= by+bh:
                 found_hover = name
@@ -485,36 +825,32 @@ class TemplateTrainer:
         
         if found_hover != self.hover_element:
             self.hover_element = found_hover
+            
+        # Check grid hover for cursor
+        if not found_hover and x < self.sidebar_width:
+             for char, (bx, by, bw, bh) in self.ui_list_chars.items():
+                 if bx <= x <= bx+bw and by <= y <= by+bh:
+                     self.user32.SetCursor(self.h_cursor_hand)
+                     break
         
         # Cursor Update
-        # Ideally this should be more frequent or handled by window class, 
-        # but setting it here covers mouse movement events.
         if self.cursors_loaded:
             if found_hover:
                 self.user32.SetCursor(self.h_cursor_hand)
             else:
-                # Default behavior
                 self.user32.SetCursor(self.h_cursor_arrow)
 
         # 2. Click Handling via Buttons
-        if event == cv2.EVENT_LBUTTONDOWN:
+        if event == cv2.EVENT_LBUTTONDOWN and found_hover:
             if found_hover == "OPEN_PDF":
                 self.load_pdf_dialog()
-                return
-            
             elif found_hover == "PREV_PAGE":
                 self.change_page(-1)
-                return
-            
             elif found_hover == "NEXT_PAGE":
                 self.change_page(1)
-                return
-            
             elif found_hover == "MODE_SWITCH":
                 if self.selection_mode == "RECT": self.selection_mode = "SELECT"
                 else: self.selection_mode = "RECT"
-                
-                # Clear state
                 self.confirmed_rect = None
                 self.editing_image = None
                 self.input_char = ""
@@ -522,34 +858,85 @@ class TemplateTrainer:
                 self.selection_current = None
                 self.selecting = False
                 print(f"Mode switched to {self.selection_mode}")
-                return
-            
             elif found_hover == "FINISH":
-                print("Finish button clicked. Exiting...")
                 self.running = False
-                return
+            elif found_hover == "PROCESS":
+                if not self.is_processing:
+                    self.detect_session_templates()
+            return # Hit a button, stop processing
 
-        # 3. Viewport Interactions
-        # Only process if NOT clicking a button (though buttons override via return above)
-        if self.pdf_doc and x > self.sidebar_width and y > self.header_height:
-            vx = x - self.sidebar_width
-            vy = y - self.header_height
+        # --- Viewport Interactions ---
+        view_w = 800
+        valid_view_x = self.sidebar_width <= x < (self.sidebar_width + view_w)
+        valid_view_y = y > self.header_height
+        vx = x - self.sidebar_width
+        vy = y - self.header_height
+
+        # State-based Interactions (Can happen outside bounds if started)
+        
+        # Pan Update
+        if event == cv2.EVENT_MOUSEMOVE and self.is_panning:
+            dx = x - self.pan_start[0]
+            dy = y - self.pan_start[1]
+            self.view_offset_x += dx
+            self.view_offset_y += dy
+            self.pan_start = (x, y)
+            return
+
+        # Pan End
+        elif event == cv2.EVENT_MBUTTONUP or (event == cv2.EVENT_RBUTTONUP):
+            self.is_panning = False
+            self.is_panning_right = False
+            return
             
-            # Pan
+        # Right Pan Update
+        if event == cv2.EVENT_MOUSEMOVE and self.is_panning_right:
+            dx = x - self.pan_start_right[0]
+            dy = y - self.pan_start_right[1]
+            self.right_view_offset_x += dx
+            self.right_view_offset_y += dy
+            self.pan_start_right = (x, y)
+            return
+            
+        # Selection Update
+        elif event == cv2.EVENT_MOUSEMOVE and self.selecting:
+            img_pos = self.screen_to_image(vx, vy)
+            self.selection_current = img_pos
+            return
+            
+        # Selection End
+        elif event == cv2.EVENT_LBUTTONUP and self.selecting:
+            self.selecting = False
+            if self.selection_start and self.selection_current:
+                x1, y1 = self.selection_start
+                x2, y2 = self.selection_current
+                # Handle possible negative coords or out of bounds if mouse flew off
+                # screen_to_image might give wild values if far off
+                
+                rx, ry = min(x1, x2), min(y1, y2)
+                rw, rh = abs(x1 - x2), abs(y1 - y2)
+                
+                if rw > 2 and rh > 2:
+                    self.confirmed_rect = (rx, ry, rw, rh)
+                    print(f"Auto-selected: {self.confirmed_rect}")
+                    if self.original_page_img is not None:
+                        safe_rx = max(0, rx)
+                        safe_ry = max(0, ry)
+                        safe_w = min(self.original_page_img.shape[1] - safe_rx, rw)
+                        safe_h = min(self.original_page_img.shape[0] - safe_ry, rh)
+                        if safe_w > 0 and safe_h > 0:
+                            roi = self.original_page_img[safe_ry:safe_ry+safe_h, safe_rx:safe_rx+safe_w]
+                            self.input_char = self.predict_char(roi)
+            return
+
+        # --- Initial Triggers (Must start in Left Viewport) ---
+        if self.pdf_doc and valid_view_x and valid_view_y:
+            
+            # Pan Start
             if event == cv2.EVENT_MBUTTONDOWN or (event == cv2.EVENT_RBUTTONDOWN):
                 self.is_panning = True
                 self.pan_start = (x, y)
-                if self.cursors_loaded: self.user32.SetCursor(self.h_cursor_arrow) # Force arrow
-            
-            elif event == cv2.EVENT_MOUSEMOVE and self.is_panning:
-                dx = x - self.pan_start[0]
-                dy = y - self.pan_start[1]
-                self.view_offset_x += dx
-                self.view_offset_y += dy
-                self.pan_start = (x, y)
-            
-            elif event == cv2.EVENT_MBUTTONUP or (event == cv2.EVENT_RBUTTONUP):
-                self.is_panning = False
+                if self.cursors_loaded: self.user32.SetCursor(self.h_cursor_arrow)
             
             # Zoom
             elif event == cv2.EVENT_MOUSEWHEEL:
@@ -561,9 +948,9 @@ class TemplateTrainer:
                 self.view_offset_y = vy - my_img * new_scale
                 self.view_scale = new_scale
             
-            # Selection Logic
-            elif event == cv2.EVENT_LBUTTONDOWN and not found_hover:
-                if self.selection_mode == "RECT":
+            # Selection Start
+            elif event == cv2.EVENT_LBUTTONDOWN:
+                 if self.selection_mode == "RECT":
                     self.confirmed_rect = None
                     self.editing_image = None
                     self.rotation_angle = 0
@@ -573,102 +960,59 @@ class TemplateTrainer:
                     self.selection_start = img_pos
                     self.selection_current = img_pos
                 
-                elif self.selection_mode == "SELECT":
+                 elif self.selection_mode == "SELECT":
                     if not self.is_panning:
                          if time.time() - self.last_smart_select_time < 0.5: return
-                         
                          self.confirmed_rect = None
                          self.editing_image = None
                          self.rotation_angle = 0
                          self.input_char = ""
-                         
                          img_pos = self.screen_to_image(vx, vy)
                          self.do_smart_selection(img_pos[0], img_pos[1])
-
-            elif event == cv2.EVENT_MOUSEMOVE and self.selecting:
-                img_pos = self.screen_to_image(vx, vy)
-                self.selection_current = img_pos
+        
+        # --- Right Viewport Interactions ---
+        # 10px buffer between viewports
+        right_vx_start = self.sidebar_width + view_w + 10
+        valid_right_view = (right_vx_start <= x < right_vx_start + view_w) and valid_view_y
+        
+        if self.pdf_doc and valid_right_view:
+             vrx = x - right_vx_start
+             vry = y - self.header_height
+             
+             # Right Pan Start
+             if event == cv2.EVENT_MBUTTONDOWN or (event == cv2.EVENT_RBUTTONDOWN):
+                self.is_panning_right = True
+                self.pan_start_right = (x, y)
+                if self.cursors_loaded: self.user32.SetCursor(self.h_cursor_arrow)
             
-            elif event == cv2.EVENT_LBUTTONUP: 
-                if self.selecting:
-                    self.selecting = False
-                    if self.selection_start and self.selection_current:
-                        x1, y1 = self.selection_start
-                        x2, y2 = self.selection_current
-                        rx, ry = min(x1, x2), min(y1, y2)
-                        rw, rh = abs(x1 - x2), abs(y1 - y2)
-                        
-                        if rw > 2 and rh > 2:
-                            self.confirmed_rect = (rx, ry, rw, rh)
-                            print(f"Auto-selected: {self.confirmed_rect}")
-                            if self.original_page_img is not None:
-                                safe_rx = max(0, rx)
-                                safe_ry = max(0, ry)
-                                safe_w = min(self.original_page_img.shape[1] - safe_rx, rw)
-                                safe_h = min(self.original_page_img.shape[0] - safe_ry, rh)
-                                if safe_w > 0 and safe_h > 0:
-                                    roi = self.original_page_img[safe_ry:safe_ry+safe_h, safe_rx:safe_rx+safe_w]
-                                    self.input_char = self.predict_char(roi)
-            
-            # Selection
-            elif event == cv2.EVENT_LBUTTONDOWN:
-                if self.selection_mode == "RECT":
-                    # Always allow starting a new selection (discards old confirmed)
-                    self.confirmed_rect = None
-                    self.editing_image = None
-                    self.rotation_angle = 0
-                    self.input_char = ""
+             # Right Zoom
+             elif event == cv2.EVENT_MOUSEWHEEL:
+                # Helper local func for inverse transform on right view
+                def screen_to_image_right(sx, sy):
+                    ix = (sx - self.right_view_offset_x) / self.right_view_scale
+                    iy = (sy - self.right_view_offset_y) / self.right_view_scale
+                    return ix, iy
                     
-                    self.selecting = True
-                    img_pos = self.screen_to_image(vx, vy)
-                    self.selection_start = img_pos
-                    self.selection_current = img_pos
-            
-            elif event == cv2.EVENT_MOUSEMOVE and self.selecting:
-                img_pos = self.screen_to_image(vx, vy)
-                self.selection_current = img_pos
-            
-            elif event == cv2.EVENT_LBUTTONUP: 
-                if self.selecting:
-                    self.selecting = False
-                    # Auto-confirm logic
-                    if self.selection_start and self.selection_current:
-                        x1, y1 = self.selection_start
-                        x2, y2 = self.selection_current
-                        rx, ry = min(x1, x2), min(y1, y2)
-                        rw, rh = abs(x1 - x2), abs(y1 - y2)
-                        
-                        if rw > 2 and rh > 2:
-                            self.confirmed_rect = (rx, ry, rw, rh)
-                            print(f"Auto-selected: {self.confirmed_rect}")
-                            
-                            # Autosuggest immediately
-                            if self.original_page_img is not None:
-                                safe_rx = max(0, rx)
-                                safe_ry = max(0, ry)
-                                safe_w = min(self.original_page_img.shape[1] - safe_rx, rw)
-                                safe_h = min(self.original_page_img.shape[0] - safe_ry, rh)
-                                
-                                if safe_w > 0 and safe_h > 0:
-                                    roi = self.original_page_img[safe_ry:safe_ry+safe_h, safe_rx:safe_rx+safe_w]
-                                    self.input_char = self.predict_char(roi)
+                zoom_factor = 1.1 if flags > 0 else 0.9
+                # Mouse relative to Viewport
+                mx_img, my_img = screen_to_image_right(vrx, vry)
+                
+                new_scale = self.right_view_scale * zoom_factor
+                new_scale = max(self.min_scale, min(new_scale, 5.0))
+                
+                self.right_view_offset_x = vrx - mx_img * new_scale
+                self.right_view_offset_y = vry - my_img * new_scale
+                self.right_view_scale = new_scale
+        
+        # Check Grid Clicks (if not handled above)
+        elif event == cv2.EVENT_LBUTTONDOWN and x < self.sidebar_width:
+             for char, (bx, by, bw, bh) in self.ui_list_chars.items():
+                 if bx <= x <= bx+bw and by <= y <= by+bh:
+                     print(f"Selected char: {char}")
+                     self.search_single_char(char)
+                     break
 
-                elif self.selection_mode == "SELECT":
-                    if not self.is_panning:
-                         # Debounce: Ignore clicks too close to last processing end
-                         if time.time() - self.last_smart_select_time < 0.5:
-                             return
 
-                         # Discard previous if exists (User requested no auto-save)
-                         if self.confirmed_rect or self.editing_image:
-                             self.confirmed_rect = None
-                             self.editing_image = None
-                             self.rotation_angle = 0
-                             self.input_char = ""
-                             
-                         # Start new selection
-                         img_pos = self.screen_to_image(vx, vy)
-                         self.do_smart_selection(img_pos[0], img_pos[1])
 
     def change_page(self, delta):
         if not self.pdf_doc: return
@@ -717,9 +1061,8 @@ class TemplateTrainer:
         mode_label = f"Mode: {self.selection_mode}"
         draw_btn_imp("MODE_SWITCH", 20, 80, 160, 25, mode_label, self.colors['btn_def'], self.colors['btn_hover'])
 
-        # Finish Button
-        fin_y = 850
-        draw_btn_imp("FINISH", 20, fin_y, 160, 40, "FINISH", self.colors['btn_finish'], self.colors['btn_finish_hover'])
+        # Buttons will be drawn after grids to be dynamic
+
 
         # --- Input Box Logic ---
         input_y_start = 120
@@ -809,7 +1152,7 @@ class TemplateTrainer:
         cell_size = 30
         cols_per_row = 6
         start_x = 20
-        self.grid_coords = {} # Clear cache
+        self.ui_list_chars = {} # Clear cache
         
         def draw_grid(chars, offset_y):
             for i, char in enumerate(chars):
@@ -822,7 +1165,12 @@ class TemplateTrainer:
                 fg = self.colors['text_dim']
                 border = self.colors['grid_border']
                 
-                if char in self.session_chars:
+                # Active Search Logic
+                if char == self.active_search_char:
+                     bg = (200, 150, 50) # Orange/Gold
+                     fg = (255, 255, 255)
+                     border = (255, 255, 255)
+                elif char in self.session_chars:
                     bg = self.colors['grid_session']
                     fg = (255, 255, 255)
                     border = bg
@@ -834,8 +1182,8 @@ class TemplateTrainer:
                 cv2.rectangle(canvas, (xx, yy), (xx+cell_size, yy+cell_size), bg, -1)
                 cv2.rectangle(canvas, (xx, yy), (xx+cell_size, yy+cell_size), border, 1)
                 
-                # Store hit box (disabled as requested)
-                # self.grid_coords[char] = (xx, yy, cell_size, cell_size)
+                # Store hit box
+                self.ui_list_chars[char] = (xx, yy, cell_size, cell_size)
                 
                 (tw, th), _ = cv2.getTextSize(char, font, 0.4, 1)
                 tx = xx + (cell_size - tw) // 2
@@ -844,11 +1192,24 @@ class TemplateTrainer:
             return offset_y + (len(chars) // cols_per_row + 1) * (cell_size + 5) + 20
 
         next_y = draw_grid(digits, input_y_start)
-        draw_grid(letters, next_y)
+        final_y = draw_grid(letters, next_y)
+
+        # Draw Buttons below grid
+        btn_start_y = final_y + 30
+        
+        # Process Button
+        proc_col = (180, 100, 40) # Orange-ish
+        proc_hover = (200, 120, 60)
+        draw_btn_imp("PROCESS", 20, btn_start_y, 160, 40, "PROCESS", proc_col, proc_hover)
+
+        # Finish Button
+        fin_y = btn_start_y + 50
+        draw_btn_imp("FINISH", 20, fin_y, 160, 40, "FINISH", self.colors['btn_finish'], self.colors['btn_finish_hover'])
         
     def compose_ui(self):
+        view_w = 800
         canvas_h = 900
-        canvas_w = 1200 + self.sidebar_width
+        canvas_w = (view_w * 2) + self.sidebar_width + 10 # 10px padding
         
         # Re-allocate canvas
         self.canvas = np.ones((canvas_h, canvas_w, 3), dtype=np.uint8)
@@ -864,12 +1225,12 @@ class TemplateTrainer:
             msg = "No PDF Loaded"
             font = cv2.FONT_HERSHEY_DUPLEX
             (tw, th), _ = cv2.getTextSize(msg, font, 0.8, 1)
-            cx = self.sidebar_width + (1200 - tw)//2
+            cx = self.sidebar_width + (canvas_w - self.sidebar_width - tw)//2
             cy = canvas_h // 2
             cv2.putText(self.canvas, msg, (cx, cy), font, 0.8, self.colors['text_dim'], 1)
             
             btn_w, btn_h = 200, 50
-            bx = self.sidebar_width + (1200 - btn_w)//2
+            bx = self.sidebar_width + (canvas_w - self.sidebar_width - btn_w)//2
             by = cy + 40
             
             # Use manual button draw here since it's outside sidebar
@@ -920,38 +1281,75 @@ class TemplateTrainer:
             else:
                 instr = "Drag Left-Mouse to Select. Right-Mouse to Pan. Wheel to Zoom."
                 col = self.colors['text_dim']
-            cv2.putText(self.canvas, instr, (sx + 350, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
-
-            # Draw Viewport
+            
+            # Draw Viewports
             if self.original_page_img is not None:
-                view_w = canvas_w - self.sidebar_width
                 view_h = canvas_h - self.header_height
                 
+                # --- LEFT VIEWPORT (Interactive) ---
                 M = np.float32([
                     [self.view_scale, 0, self.view_offset_x],
                     [0, self.view_scale, self.view_offset_y]
                 ])
                 
-                viewport_img = cv2.warpAffine(self.original_page_img, M, (view_w, view_h), borderValue=(30, 30, 30))
+                left_view_img = cv2.warpAffine(self.original_page_img, M, (view_w, view_h), borderValue=(30, 30, 30))
                 
                 # Selection Logic on Viewport
                 if self.selecting and self.selection_start and self.selection_current:
                     s_sx, s_sy = self.image_to_screen(*self.selection_start)
                     c_sx, c_sy = self.image_to_screen(*self.selection_current)
-                    cv2.rectangle(viewport_img, (s_sx, s_sy), (c_sx, c_sy), (0, 0, 255), 1)
+                    cv2.rectangle(left_view_img, (s_sx, s_sy), (c_sx, c_sy), (0, 0, 255), 1)
                 elif self.selection_start and self.selection_current and not self.confirmed_rect:
                     s_sx, s_sy = self.image_to_screen(*self.selection_start)
                     c_sx, c_sy = self.image_to_screen(*self.selection_current)
-                    cv2.rectangle(viewport_img, (s_sx, s_sy), (c_sx, c_sy), (0, 200, 0), 2)
+                    cv2.rectangle(left_view_img, (s_sx, s_sy), (c_sx, c_sy), (0, 200, 0), 2)
                     
                 if self.confirmed_rect:
                     rx, ry, rw, rh = self.confirmed_rect
                     p1 = self.image_to_screen(rx, ry)
                     p2 = self.image_to_screen(rx+rw, ry+rh)
-                    cv2.rectangle(viewport_img, p1, p2, (0, 255, 0), 2)
+                    cv2.rectangle(left_view_img, p1, p2, (0, 255, 0), 2)
                 
-                self.canvas[self.header_height:, self.sidebar_width:] = viewport_img
+                # Place Left Viewport
+                l_x_start = self.sidebar_width
+                self.canvas[self.header_height:, l_x_start:l_x_start+view_w] = left_view_img
+                
+                # --- RIGHT VIEWPORT (Results - Stable) ---
+                # Use separate transform for stability
+                M_right = np.float32([
+                    [self.right_view_scale, 0, self.right_view_offset_x],
+                    [0, self.right_view_scale, self.right_view_offset_y]
+                ])
+                
+                right_view_img = cv2.warpAffine(self.original_page_img, M_right, (view_w, view_h), borderValue=(20, 20, 20))
+                
+                # Draw Helper for ImageToScreen using Right Calc
+                def image_to_screen_right(ix, iy):
+                    sx = ix * self.right_view_scale + self.right_view_offset_x
+                    sy = iy * self.right_view_scale + self.right_view_offset_y
+                    return int(sx), int(sy)
 
+                # Draw Matched Instances
+                # Draw Matched Instances
+                if self.matched_instances:
+                    for (rx, ry, rw, rh, label) in self.matched_instances:
+                         p1 = image_to_screen_right(rx, ry)
+                         p2 = image_to_screen_right(rx+rw, ry+rh)
+                         
+                         cv2.rectangle(right_view_img, p1, p2, (0, 255, 255), 2)
+                         # Optional: Draw label if needed, but might be cluttered
+                         # cv2.putText(right_view_img, label, (p1[0], p1[1]-2), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+
+                # Draw Label
+                cv2.rectangle(right_view_img, (0, 0), (view_w, 30), (40, 40, 40), -1)
+                msg = f"Cumulative Matches: {len(self.matched_instances)}"
+                cv2.putText(right_view_img, msg, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
+
+                r_x_start = l_x_start + view_w + 10
+                # Check bounds
+                if r_x_start + view_w <= canvas_w:
+                    self.canvas[self.header_height:, r_x_start:r_x_start+view_w] = right_view_img
+        
         return self.canvas
 
     def save_template(self, char_key):
@@ -1012,11 +1410,26 @@ class TemplateTrainer:
             self.selection_current = None
             self.input_char = "" # Reset buffer
             print(f"Saved {path}")
+            
+            # Auto-trigger search for the newly added char
+            self.search_single_char(char_key)
 
     def run(self):
         while self.running:
             ui = self.compose_ui()
             cv2.imshow(self.window_name, ui)
+            
+            # Keep the detection window alive if it exists
+            if self.detection_full_img is not None:
+                try:
+                    if cv2.getWindowProperty(self.det_window_name, cv2.WND_PROP_VISIBLE) >= 1:
+                        self.update_detection_view()
+                    else:
+                        # User closed it
+                        self.detection_full_img = None
+                except:
+                    pass
+                    
             key = cv2.waitKey(20) & 0xFF
             
             if key == 27: # Esc
@@ -1117,12 +1530,18 @@ def ask_template_mode():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("image_path", nargs="?", help="Optional initial PDF path")
+    parser.add_argument("--debug-page", type=int, default=None, help="Specific page to enable debug/cache for (1-based)")
     # We ignore --output_dir from args if we rely on the GUI choice, 
     # but we can keep it as an override if needed. 
     # The user specifically asked to choose "before starting", so we prioritize the GUI loop.
     args = parser.parse_args()
     
     initial_pdf = args.image_path
+    
+    # helper for 0-based index
+    debug_page_idx = None
+    if args.debug_page is not None:
+        debug_page_idx = args.debug_page - 1
     
     while True:
         mode = ask_template_mode()
@@ -1133,7 +1552,7 @@ if __name__ == "__main__":
             
         print(f"Starting in mode: {mode}")
         
-        app = TemplateTrainer(output_dir=mode)
+        app = TemplateTrainer(output_dir=mode, debug_page=debug_page_idx)
         
         if initial_pdf:
             app.load_pdf(initial_pdf)

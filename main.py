@@ -127,6 +127,48 @@ def main():
         print("No templates loaded. Use --font or populate templates directory.")
         return
 
+    # Calculate dynamic candidate size limits based on templates
+    max_tmpl_dim = 0
+    min_tmpl_dim = 1000
+    
+    if tm.templates:
+         max_tmpl_dim = max(max(t.shape[:2]) for t in tm.templates.values())
+         min_tmpl_dim = min(min(t.shape[:2]) for t in tm.templates.values())
+    
+    # Default loose limits
+    cand_max_w = 200
+    cand_max_h = 200
+    cand_min_w = 5
+    cand_min_h = 8
+    
+    if max_tmpl_dim > 0:
+         ratio = 1.0
+         # If using directory templates (likely high-res), adjust for zoom ratio
+         if not args.font and args.capture_zoom and args.zoom:
+             ratio = args.capture_zoom / args.zoom
+         
+         # Expected sizes in detection image
+         expected_max_size = max_tmpl_dim / ratio
+         expected_min_size = min_tmpl_dim / ratio
+         
+         # User filter: 
+         # Max: +100% (Factor 2.0)
+         # Min: Strict 100% (Factor 1.0) - Don't accept smaller than templates
+         limit_max = int(expected_max_size * 2.0)
+         limit_min = int(expected_min_size * 0.9)
+         
+         # Safety floor
+         limit_max = max(limit_max, 20)
+         limit_min = max(limit_min, 4)
+         
+         cand_max_w = limit_max
+         cand_max_h = limit_max
+         cand_min_w = limit_min
+         cand_min_h = limit_min
+         
+         print(f"Dynamic Candidate Size Limits: Min {limit_min}px, Max {limit_max}px (Ratio: {ratio:.2f})")
+
+
     # 2. Process Image(s)
     # List of dicts: {'suffix': str, 'img': np.array, 'doc': fitz.Document, 'page': int}
     items_to_process = [] 
@@ -213,13 +255,23 @@ def main():
 
         print(f"--- Processing{suffix} ---")
         try:
-            _, gray_img, binary_img = preprocess_from_array(orig_img)
+            # Dynamic Line Removal based on Zoom
+            # Heuristic: Zoom 6.0 ~~ 50-60. Zoom 1.0 ~~ 10.
+            # Formula: min_line_length = max(40, int(args.zoom * 10))
+            # Justification: Lines (wires) should be significantly longer than characters.
+            line_len = 50
+            if doc is not None: # If PDF based (args.zoom relevant)
+                 line_len = max(40, int(args.zoom * 10))
+            
+            print(f"Using min_line_length={line_len} for line removal.")
+            _, gray_img, binary_img = preprocess_from_array(orig_img, min_line_length=line_len)
         except Exception as e:
             print(f"Error processing image section{suffix}: {e}")
             continue
 
         # 3. Get Candidates
-        candidates = get_character_candidates(binary_img)
+        # 3. Get Candidates
+        candidates = get_character_candidates(binary_img, min_w=cand_min_w, min_h=cand_min_h, max_w=cand_max_w, max_h=cand_max_h)
         print(f"Found {len(candidates)} candidate regions.")
         
         # Optimize PDF High-Res Extraction

@@ -27,7 +27,7 @@ def remove_lines(binary, min_line_length=40, thickness=2):
     
     return clean_binary
 
-def preprocess_from_array(img):
+def preprocess_from_array(img, min_line_length=50):
     """
     Preprocesses a loaded image (numpy array).
     """
@@ -47,7 +47,8 @@ def preprocess_from_array(img):
         binary = cv2.bitwise_not(binary)
         
     # Remove large lines (circuits) to isolate text
-    binary = remove_lines(binary, min_line_length=25)
+    # tuned to 50: preserves text spines (~30-40px) but removes long wires
+    binary = remove_lines(binary, min_line_length=min_line_length)
         
     # Morphological operations to clean up
     # Closing to connect broken characters - BLOCKED: This merges text with lines in high-res diagrams
@@ -77,7 +78,7 @@ def get_character_candidates(binary_image, min_w=5, min_h=8, max_w=200, max_h=20
     Finds countours in the binary image.
     Returns: list of dicts with bounding boxes and other info.
     """
-    contours, _ = cv2.findContours(binary_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(binary_image, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
     
     candidates = []
     for cnt in contours:
