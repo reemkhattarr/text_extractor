@@ -47,6 +47,25 @@ def match_character(candidate_img, templates, expected_scale=None, debug=False, 
             
         h_rot, w_rot = rotated_cand.shape[:2]
         
+        # --- Tight Crop to Content ---
+        # Crucial for rotated characters (45 degrees) where the bounding box of the rotation 
+        # is much larger than the character itself.
+        if len(rotated_cand.shape) == 3:
+            gray_rot = cv2.cvtColor(rotated_cand, cv2.COLOR_BGR2GRAY)
+        else:
+            gray_rot = rotated_cand
+            
+        # Threshold: Input is white bg, black text -> Invert to find text
+        _, thresh_temp = cv2.threshold(gray_rot, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        
+        coords = cv2.findNonZero(thresh_temp)
+        if coords is not None:
+             rx, ry, rw, rh = cv2.boundingRect(coords)
+             # Update rotated_cand to the tight crop
+             rotated_cand = rotated_cand[ry:ry+rh, rx:rx+rw]
+             h_rot, w_rot = rotated_cand.shape[:2]
+        # -----------------------------
+        
         for char, tmpl in templates.items():
             h_tmpl, w_tmpl = tmpl.shape[:2]
             if h_tmpl == 0: continue
@@ -137,7 +156,10 @@ def match_character(candidate_img, templates, expected_scale=None, debug=False, 
                      # If Parent != -1, it's a hole (inner contour)
                      for i in range(len(contours)):
                          if hierarchy[0][i][3] != -1:
-                             holes += 1
+                             # Check hole area to ignore noise
+                             area = cv2.contourArea(contours[i])
+                             if area > 2.0: # Ignore tiny noise holes < 2px
+                                 holes += 1
                  return holes
 
             tmpl_holes = get_hole_count(thresh_tmpl)

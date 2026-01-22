@@ -582,13 +582,15 @@ class TemplateTrainer:
                 
                 print(f"Cached {len(self.page_candidates)} candidates.")
                 
-                if self.debug_page is not None and self.current_page == self.debug_page:
-                     vis_cand = self.original_page_img.copy()
-                     for cand in self.page_candidates:
-                        x, y, w, h = cand['bbox']
-                        cv2.rectangle(vis_cand, (x, y), (x+w, y+h), (0, 0, 255), 1)
-                     cv2.imwrite(f"debug_candidates_page_{self.current_page}.png", vis_cand)
-                     print(f"saved debug_candidates_page_{self.current_page}.png")
+                # Always save debug visualization of candidates
+                vis_cand = self.original_page_img.copy()
+                for cand in self.page_candidates:
+                   x, y, w, h = cand['bbox']
+                   cv2.rectangle(vis_cand, (x, y), (x+w, y+h), (0, 0, 255), 1)
+                
+                debug_path = f"debug_candidates_page_{self.current_page + 1}.png"
+                cv2.imwrite(debug_path, vis_cand)
+                print(f"Saved candidate debug visualization to {debug_path}")
 
              except Exception as e:
                 print(f"Error computing candidates: {e}")
@@ -634,13 +636,17 @@ class TemplateTrainer:
         debug_ts = int(time.time())
         debug_dir = f"debug_search_{char_key}_{debug_ts}"
         
+        # DEBUG: Saving visualization to {debug_dir}
         print(f"DEBUG: Saving visualization to {debug_dir}")
         
         for i, cand in enumerate(candidates):
             roi = extract_candidate_roi(gray, cand)
             
+            # Enable debug only for the first 20 to avoid I/O flood
+            do_debug = (i < 20)
+            
             # Use stricter threshold or same? Using 0.333 scale (Zoom 8 vs 24)
-            best_char, best_score = match_character(roi, templates, expected_scale=0.333)
+            best_char, best_score = match_character(roi, templates, expected_scale=0.333, debug=do_debug, debug_dir=debug_dir)
             
             if best_char == char_key and best_score > 0.5:
                  x, y, w, h = cand['bbox']
