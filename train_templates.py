@@ -41,6 +41,12 @@ class TemplateTrainer:
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
 
+        # Set scale tolerance based on mode
+        # Schematics require stricter tolerance (20%) because text sizes vary and templates are small.
+        # Placements allow looser tolerance (50%) as validated previously.
+        self.scale_tolerance = 0.20 if "schematic" in output_dir else 0.50
+        print(f"Scale Tolerance set to {self.scale_tolerance}")
+
         # State
         self.running = True
         self.pdf_doc = None
@@ -403,7 +409,7 @@ class TemplateTrainer:
                 
                 # Match against templates (handles 0-315 rotation now)
                 # We expect candidate (Zoom 8) to be ~0.33x of template (Zoom 24).
-                best_char, best_score = match_character(roi, templates, expected_scale=0.333)
+                best_char, best_score = match_character(roi, templates, expected_scale=0.333, scale_tolerance=self.scale_tolerance)
                 
                 if best_score > 0.65: # Relaxed slightly from 0.70 to improve recall
                     x, y, w, h = cand['bbox']
@@ -646,7 +652,7 @@ class TemplateTrainer:
             do_debug = (i < 20)
             
             # Use stricter threshold or same? Using 0.333 scale (Zoom 8 vs 24)
-            best_char, best_score = match_character(roi, templates, expected_scale=0.333, debug=do_debug, debug_dir=debug_dir)
+            best_char, best_score = match_character(roi, templates, expected_scale=0.333, scale_tolerance=self.scale_tolerance, debug=do_debug, debug_dir=debug_dir)
             
             if best_char == char_key and best_score > 0.5:
                  x, y, w, h = cand['bbox']

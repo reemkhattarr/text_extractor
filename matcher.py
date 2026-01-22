@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 
-def match_character(candidate_img, templates, expected_scale=None, debug=False, debug_dir="debug_match"):
+def match_character(candidate_img, templates, expected_scale=None, scale_tolerance=0.50, debug=False, debug_dir="debug_match"):
     """
     Matches a candidate image crop against all templates.
     Returns: (best_char, best_score)
@@ -76,7 +76,7 @@ def match_character(candidate_img, templates, expected_scale=None, debug=False, 
             
             if expected_scale is not None:
                 # Enforce STRICT scale check (±50% to accommodate small char noise)
-                if abs(observed_scale - expected_scale) / expected_scale > 0.50:
+                if abs(observed_scale - expected_scale) / expected_scale > scale_tolerance:
                     if debug and angle == 0: 
                          print(f"DEBUG: Rejected scale {observed_scale:.3f} (Exp: {expected_scale}) for {char}. Cand H: {h_rot}, Tmpl H: {h_tmpl}")
                          # Vis rejection
