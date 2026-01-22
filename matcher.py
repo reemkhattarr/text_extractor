@@ -211,4 +211,4 @@ def match_character(candidate_img, templates, expected_scale=None, scale_toleran
                 best_char = char
                 best_angle = angle
             
-    return best_char, best_score
+    return best_char, best_score, best_angle

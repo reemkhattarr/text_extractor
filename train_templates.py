@@ -409,7 +409,7 @@ class TemplateTrainer:
                 
                 # Match against templates (handles 0-315 rotation now)
                 # We expect candidate (Zoom 8) to be ~0.33x of template (Zoom 24).
-                best_char, best_score = match_character(roi, templates, expected_scale=0.333, scale_tolerance=self.scale_tolerance)
+                best_char, best_score, best_angle = match_character(roi, templates, expected_scale=0.333, scale_tolerance=self.scale_tolerance)
                 
                 if best_score > 0.65: # Relaxed slightly from 0.70 to improve recall
                     x, y, w, h = cand['bbox']
@@ -595,8 +595,8 @@ class TemplateTrainer:
                    cv2.rectangle(vis_cand, (x, y), (x+w, y+h), (0, 0, 255), 1)
                 
                 debug_path = f"debug_candidates_page_{self.current_page + 1}.png"
-                cv2.imwrite(debug_path, vis_cand)
-                print(f"Saved candidate debug visualization to {debug_path}")
+                # cv2.imwrite(debug_path, vis_cand)
+                # print(f"Saved candidate debug visualization to {debug_path}")
 
              except Exception as e:
                 print(f"Error computing candidates: {e}")
@@ -652,7 +652,7 @@ class TemplateTrainer:
             do_debug = (i < 20)
             
             # Use stricter threshold or same? Using 0.333 scale (Zoom 8 vs 24)
-            best_char, best_score = match_character(roi, templates, expected_scale=0.333, scale_tolerance=self.scale_tolerance, debug=do_debug, debug_dir=debug_dir)
+            best_char, best_score, best_angle = match_character(roi, templates, expected_scale=0.333, scale_tolerance=self.scale_tolerance, debug=do_debug, debug_dir=debug_dir)
             
             if best_char == char_key and best_score > 0.5:
                  x, y, w, h = cand['bbox']

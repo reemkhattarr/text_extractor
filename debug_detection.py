@@ -31,7 +31,7 @@ def debug_candidates(pdf_path, page_num, zoom=6.0, templates_dir="templates"):
     _, gray, binary = preprocess_from_array(img, min_line_length=line_len)
     
     # Save binary for inspection
-    cv2.imwrite("debug_binary.png", binary)
+    # cv2.imwrite("debug_binary.png", binary)
     
     # 3. Get Candidates (Same logic as main.py)
     candidates = get_character_candidates(binary)
@@ -51,7 +51,7 @@ def debug_candidates(pdf_path, page_num, zoom=6.0, templates_dir="templates"):
         
         # 4. Match against Templates (New feature)
         roi = extract_candidate_roi(gray, cand)
-        best_char, best_score = match_character(roi, tm.templates)
+        best_char, best_score, best_angle = match_character(roi, tm.templates)
         
         is_match = False
         if best_score > 0.5:
