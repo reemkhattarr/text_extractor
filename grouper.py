@@ -312,7 +312,7 @@ def _classify_label(text):
     # 1-2 Letters + 1-2 Digits (user said 1-2, but lets support 1-3)
     # e.g. R1, C12, SW1, U100
     
-    if re.match(r'^[A-Z]{1,2}[0-9]{1,3}$', text):
+    if re.match(r'^[A-Z]{1,2}[0-9]{1,2}$', text):
         return "COMPONENT"
     
     if re.match(r'^[A-Z]+$', text):

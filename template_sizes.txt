@@ -1,0 +1,1 @@
+Checking templates in schematics_templates

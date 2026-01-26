@@ -19,7 +19,7 @@ def remove_lines(binary, min_line_length=40, thickness=2):
     
     # 4. Dilate lines slightly to ensure clean removal
     kernel = np.ones((thickness, thickness), np.uint8)
-    lines = cv2.dilate(lines, kernel, iterations=3)
+    lines = cv2.dilate(lines, kernel, iterations=1)
     
     # 5. Subtract lines from original binary
     # We use bitwise_and with the INVERSE of the lines

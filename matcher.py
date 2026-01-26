@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 
-def match_character(candidate_img, templates, expected_scale=None, scale_tolerance=0.50, debug=False, debug_dir="debug_match"):
+def match_character(candidate_img, templates, expected_scale=None, scale_tolerance=0.50, debug=False, debug_dir="debug_match", rotation_angles=None):
     """
     Matches a candidate image crop against all templates.
     Returns: (best_char, best_score)
@@ -10,9 +10,8 @@ def match_character(candidate_img, templates, expected_scale=None, scale_toleran
     if debug and not os.path.exists(debug_dir):
         os.makedirs(debug_dir)
 
-    best_score = -1
-    best_char = "?"
-    best_angle = 0
+    # Store best match for each angle: angle -> (score, char)
+    best_per_angle = {}
     
     h_cand, w_cand = candidate_img.shape[:2]
     if h_cand < 5 or w_cand < 2: 
@@ -20,7 +19,7 @@ def match_character(candidate_img, templates, expected_scale=None, scale_toleran
         return None, 0.0
 
     # Define rotations to check (0 to 315 in 45 deg steps)
-    rotations = range(0, 360, 45)
+    rotations = rotation_angles if rotation_angles is not None else range(0, 360, 45)
     
     def rotate_img(image, angle):
         if angle == 0: return image
@@ -42,6 +41,9 @@ def match_character(candidate_img, templates, expected_scale=None, scale_toleran
         return cv2.warpAffine(image, M, (nW, nH), borderValue=255)
 
     for angle in rotations:
+        local_best_score = -1
+        local_best_char = "?"
+        
         # Rotate candidate
         rotated_cand = rotate_img(candidate_img, angle)
             
@@ -206,9 +208,34 @@ def match_character(candidate_img, templates, expected_scale=None, scale_toleran
                  fname = f"match_attempt_{char}_{angle}deg_score_{max_val:.2f}.png"
                  cv2.imwrite(os.path.join(debug_dir, fname), vis)
             
-            if max_val > best_score:
-                best_score = max_val
-                best_char = char
-                best_angle = angle
-            
-    return best_char, best_score, best_angle
+            # Track best for this specific angle
+            if max_val > local_best_score:
+                local_best_score = max_val
+                local_best_char = char
+        
+        # After checking all templates for this angle, store the winner
+        if local_best_score > -1:
+             best_per_angle[angle] = (local_best_score, local_best_char)
+
+    if not best_per_angle:
+        return "?", 0.0, 0
+        
+    # Find Global Best
+    best_angle_glob = max(best_per_angle, key=lambda a: best_per_angle[a][0])
+    best_score_glob, best_char_glob = best_per_angle[best_angle_glob]
+    
+    # Apply Bias for 0 degrees (Horizontal)
+    # If 0 degree match is 'close enough' to the best match, prefer it.
+    # This prevents noise or minor shape symmetries from flipping characters to 90/180/270.
+    BIAS_TOLERANCE = 0.95 # 0-deg score must be at least 95% of the best score
+    
+    if 0 in best_per_angle:
+        s0, c0 = best_per_angle[0]
+        if s0 >= best_score_glob * BIAS_TOLERANCE:
+             return c0, s0, 0
+             
+    # Secondary Bias: 180 degrees (upside down) is often better than 90/270 for horizontal text
+    # But usually 0 is enough. 
+    # If 180 is the global best, we keep it (it might be a flipped component).
+    
+    return best_char_glob, best_score_glob, best_angle_glob

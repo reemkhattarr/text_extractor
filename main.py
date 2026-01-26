@@ -1,5 +1,6 @@
 import cv2
 import sys
+import os
 import argparse
 from pathlib import Path
 
@@ -156,7 +157,7 @@ def main():
          
          # User filter: 
          limit_max = int(expected_max_size * 2.0)
-         limit_strict_min = int(expected_longest * 0.9)
+         limit_strict_min = int(expected_longest * 0.90)
          
          # Safety floor
          limit_max = max(limit_max, 20)
@@ -341,11 +342,35 @@ def main():
 
         print(f"--- Processing {suffix} ({rot_name}) ---")
         try:
-            line_len = 50
-            if doc is not None:
+            # Determine line removal threshold based on template size
+            # User request: "remove only lines ... at least 2x longer ... than the biggest template size"
+            line_len = 100 # Fallback default
+            
+            # We need to access expected_max_size. It was calculated in the setup phase if max_tmpl_dim > 0.
+            # To be safe and avoid scope issues, we can re-derive the logic or check locals.
+            # But better: Check if we have templates and calculate dynamically.
+            
+            if max_tmpl_dim > 0:
+                 # Re-calculate ratio valid for this run
+                 ratio = 1.0
+                 if not args.font and args.capture_zoom and args.zoom:
+                     ratio = args.capture_zoom / args.zoom
+                     
+                 curr_expected_max_size = max_tmpl_dim / ratio
+                 line_len = int(curr_expected_max_size * 2.0)
+                 
+                 # Ensure it's not too small (e.g. if templates are tiny)
+                 line_len = max(line_len, 50)
+                 print(f"DEBUG: Using line_len={line_len} (2 * MaxTmpl {int(curr_expected_max_size)})")
+            elif doc is not None:
                  line_len = max(40, int(args.zoom * 10))
+
             
             _, gray_img, binary_img = preprocess_from_array(orig_img, min_line_length=line_len)
+            
+            # DEBUG: Save binary image
+            cv2.imwrite(f"debug_binary_{suffix}.png", binary_img)
+            print(f"Saved debug_binary_{suffix}.png")
         except Exception as e:
             print(f"Error processing image section {suffix}: {e}")
             continue
@@ -356,7 +381,16 @@ def main():
         candidates = []
         if max_tmpl_dim > 0:
             for c in raw_candidates:
-                if max(c['w'], c['h']) >= limit_strict_min:
+                longest = max(c['w'], c['h'])
+                ratio = c['h'] / float(c['w']) if c['w'] > 0 else 0
+                
+                # 1. Standard Size Check
+                if longest >= limit_strict_min:
+                    candidates.append(c)
+                # 2. Rescue Small Thin Characters (e.g. '1', 'l', 'I')
+                # These might be smaller than the average letter but are valid if they are tall/thin.
+                # 'D' noise is usually blocky (ratio ~1.0-1.5), so checking ratio > 2.0 filters it out.
+                elif longest >= limit_strict_min * 0.5 and ratio > 2.0:
                     candidates.append(c)
         else:
             candidates = raw_candidates
@@ -413,7 +447,13 @@ def main():
             if roi is None or roi.size == 0:
                 continue
 
-            char, score, angle = match_character(roi, tm.templates)
+            char, score, angle = match_character(roi, tm.templates, rotation_angles=[0])
+            
+            if score > 0.5:
+                # print(f"Match: {char} ({score:.2f}) at {cand['x']},{cand['y']}")
+                pass
+            elif score > 0.3:
+                 print(f"Low Score Match: {char} ({score:.2f}) at {cand['x']},{cand['y']} Size: {cand['w']}x{cand['h']}")
             
             if score > 0.5:
                 match_data = cand.copy()
