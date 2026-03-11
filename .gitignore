@@ -37,3 +37,6 @@ Thumbs.db
 
 # Byte-compiled
 *.pyc
+
+# PDFs
+pico-datasheet.pdf
