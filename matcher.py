@@ -88,7 +88,7 @@ def match_character(candidate_img, templates, expected_scale=None, scale_toleran
                              vis = np.full((vis_h, vis_w), 255, dtype=np.uint8)
                              vis[:h_rot, :w_rot] = rotated_cand
                              vis[:h_tmpl, w_rot+10:] = tmpl
-                             cv2.imwrite(os.path.join(debug_dir, f"REJECT_scale_{char}_{angle}_{observed_scale:.2f}.png"), vis)
+                             #cv2.imwrite(os.path.join(debug_dir, f"REJECT_scale_{char}_{angle}_{observed_scale:.2f}.png"), vis)
                     continue
             else:
                  if observed_scale < 0.2 or observed_scale > 2.0:
@@ -118,7 +118,7 @@ def match_character(candidate_img, templates, expected_scale=None, scale_toleran
                              vis = np.full((vis_h, vis_w), 255, dtype=np.uint8)
                              vis[:h_rot, :w_rot] = rotated_cand
                              vis[:h_tmpl, w_rot+10:] = tmpl
-                             cv2.imwrite(os.path.join(debug_dir, f"REJECT_width_{char}_{angle}.png"), vis)
+                             #cv2.imwrite(os.path.join(debug_dir, f"REJECT_width_{char}_{angle}.png"), vis)
                 continue
             
             # Check Pixel Mass...
@@ -206,7 +206,7 @@ def match_character(candidate_img, templates, expected_scale=None, scale_toleran
                  # Visualize valid attempts regardless of score if it passed pre-checks
                  vis = np.hstack([canvas, cv2.resize(resized_tmpl, (canvas.shape[1], canvas.shape[0]))])
                  fname = f"match_attempt_{char}_{angle}deg_score_{max_val:.2f}.png"
-                 cv2.imwrite(os.path.join(debug_dir, fname), vis)
+                 #cv2.imwrite(os.path.join(debug_dir, fname), vis)
             
             # Track best for this specific angle
             if max_val > local_best_score:

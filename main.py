@@ -17,6 +17,7 @@ def main():
     parser.add_argument("--zoom", help="Zoom factor for PDF rendering (detection)", type=float, default=6.0)
     parser.add_argument("--capture-zoom", help="Zoom factor for High-Res template matching", type=float, default=24.0)
     parser.add_argument("--page", help="Specific page number to process (1-based)", type=int, default=None)
+    parser.add_argument("--crop", help="Crop region x,y,w,h (in pixels at --zoom level)", default=None)
     args = parser.parse_args()
 
     # 0. Interactive Template Selection (if not using font gen)
@@ -223,6 +224,23 @@ def main():
                 if img is None:
                     print(f"Failed to render page {i+1}")
                     continue
+                
+                # Apply Crop
+                if args.crop:
+                    try:
+                        cx, cy, cw, ch = map(int, args.crop.split(','))
+                        # Validate
+                        h, w = img.shape[:2]
+                        cx = max(0, min(cx, w))
+                        cy = max(0, min(cy, h))
+                        cw = min(cw, w - cx)
+                        ch = min(ch, h - cy)
+                        if cw > 0 and ch > 0:
+                             print(f"Applying crop to Page {i+1}: {cx},{cy},{cw},{ch}")
+                             img = img[cy:cy+ch, cx:cx+cw]
+                    except Exception as e:
+                        print(f"Crop Error: {e}")
+
                 items_to_process.append({
                     'suffix': f"_page_{i+1}", 
                     'img': img,
@@ -240,20 +258,61 @@ def main():
         if img is None:
             print(f"Error loading image {args.image_path}")
             return
-        items_to_process.append({
-            'suffix': "",
-            'img': img,
-            'doc': None,
-            'page': None
-        })
 
-    # PROPOSED CHANGE: Generate rotated dictionary tasks
+        # Handle Crop for items_to_process
+        if args.crop:
+            try:
+                cx, cy, cw, ch = map(int, args.crop.split(','))
+                # Validate bounds
+                h, w = img.shape[:2]
+                cx = max(0, min(cx, w))
+                cy = max(0, min(cy, h))
+                cw = min(cw, w - cx)
+                ch = min(ch, h - cy)
+                
+                if cw > 0 and ch > 0:
+                     print(f"Applying crop: {cx},{cy},{cw},{ch}")
+                     img = img[cy:cy+ch, cx:cx+cw]
+                items_to_process.append({
+                    'suffix': "",
+                    'img': img,
+                    'doc': None,
+                    'page': None
+                })
+            except Exception as e:
+                print(f"Invalid crop format: {e}")
+                return
+        else:
+             items_to_process.append({
+                'suffix': "",
+                'img': img,
+                'doc': None,
+                'page': None
+            })
+
+    # Process using the refactored system
+    for item in items_to_process:
+        results = process_page_system(
+            base_img=item['img'],
+            doc=item['doc'],
+            page_num_0based=item['page'],
+            tm=tm,
+            args=args,
+            base_suffix=item['suffix']
+        )
+        
+def process_page_system(base_img, doc, page_num_0based, tm, args, base_suffix="", visualize=True):
+    """
+    Reusable pipeline for processing a single base image (0-deg).
+    Generates rotations, runs detection, grouping, and visualization.
+    Returns the list of final filtered labels.
+    """
     import numpy as np
+    from image_processor import preprocess_from_array
     
+    # ... Helper rotation function ...
     def rotate_img_full(image, angle):
         if angle == 0: return image, None
-        
-        # General rotation
         (h, w) = image.shape[:2]
         (cX, cY) = (w // 2, h // 2)
         M = cv2.getRotationMatrix2D((cX, cY), angle, 1.0)
@@ -263,379 +322,270 @@ def main():
         nH = int((h * cos) + (w * sin))
         M[0, 2] += (nW / 2) - cX
         M[1, 2] += (nH / 2) - cY
-        
-        # Fill with white (background)
         b_val = (255, 255, 255)
-        if len(image.shape) == 2: # Grayscale
-            b_val = 255
-            
+        if len(image.shape) == 2: b_val = 255
         rotated = cv2.warpAffine(image, M, (nW, nH), borderValue=b_val)
         return rotated, M
 
-    print("Generating rotated tasks (0°, 90° CW, 45° CCW)...")
-    final_tasks = []
+    print("Generating rotated tasks (0, 90 CW, 45 CCW)...")
+    tasks = []
     
-    # Store aggregated results: page_id -> { 'orig_img': img, 'labels': [] }
-    # page_id can be the page index or suffix
+    # 1. 0 degrees
+    tasks.append({
+        'img': base_img,
+        'matrix': None,
+        'rotation_name': "0_deg",
+        'doc': doc,
+        'page': page_num_0based
+    })
     
-    for item in items_to_process:
-        base_img = item['img']
-        base_suffix = item['suffix']
-        page_id = item['page'] if item['page'] is not None else 0
-        
-        # 1. 0 degrees (Original)
-        item['matrix'] = None
-        item['rotation_name'] = "0_deg"
-        item['page_id'] = page_id
-        final_tasks.append(item)
-        
-        # 2. 90 degrees Clockwise (-90)
-        img_90cw, M_90 = rotate_img_full(base_img, -90)
-        final_tasks.append({
-            'suffix': base_suffix + "_rot90CW",
-            'img': img_90cw,
-            'doc': None,
-            'page': None,
-            'matrix': M_90,
-            'rotation_name': "90_CW",
-            'page_id': page_id
-        })
-        
-        # 3. 45 degrees Counter-Clockwise (+45)
-        img_45ccw, M_45 = rotate_img_full(base_img, 45)
-        final_tasks.append({
-            'suffix': base_suffix + "_rot45CCW",
-            'img': img_45ccw,
-            'doc': None,
-            'page': None,
-            'matrix': M_45,
-            'rotation_name': "45_CCW",
-            'page_id': page_id
-        })
-        
-    items_to_process = final_tasks
+    # 2. 90 degrees Clockwise (-90)
+    img_90cw, M_90 = rotate_img_full(base_img, -90)
+    tasks.append({
+        'img': img_90cw,
+        'matrix': M_90,
+        'rotation_name': "90_CW",
+        'doc': None, # Only use doc for 0 degree high-res crop usually
+        'page': None
+    })
     
-    # Dictionary to hold final results per original page
-    # key: page_id
-    # value: { 'orig_img': numpy_array, 'labels': list_of_dicts, 'filepath': str }
-    page_results_map = {}
-
-    from image_processor import preprocess_from_array
-
-    for item in items_to_process:
-        suffix = item['suffix']
-        orig_img = item['img']
-        doc = item['doc']
-        page_num = item['page']
-        matrix = item.get('matrix')
-        page_id = item.get('page_id')
-        rot_name = item.get('rotation_name', '0')
-
-        # Initialize result entry for this page if strictly original (0 deg) info needed
-        if page_id not in page_results_map:
-             page_results_map[page_id] = { 'labels': []}
-
-        # If this is the 0-degree image, save it as the base for visualization
-        if matrix is None:
-             page_results_map[page_id]['orig_img'] = orig_img
-             page_results_map[page_id]['base_filepath'] = args.image_path
-
-        print(f"--- Processing {suffix} ({rot_name}) ---")
+    # 3. 45 degrees Counter-Clockwise (+45)
+    img_45ccw, M_45 = rotate_img_full(base_img, 45)
+    tasks.append({
+        'img': img_45ccw,
+        'matrix': M_45,
+        'rotation_name': "45_CCW",
+        'doc': None,
+        'page': None
+    })
+    
+    # Result Aggregation
+    all_labels = []
+    
+    # Calculate limits once
+    max_tmpl_dim = 0
+    if tm.templates:
+         max_tmpl_dim = max(max(t.shape[:2]) for t in tm.templates.values())
+         
+    # Setup candidate params
+    # Default loose limits
+    cand_max_w = 200
+    cand_max_h = 200
+    cand_min_w = 5
+    cand_min_h = 8
+    limit_strict_min = 5
+    
+    if max_tmpl_dim > 0:
+         ratio = 1.0
+         if not args.font and args.capture_zoom and args.zoom:
+             ratio = args.capture_zoom / args.zoom
+         
+         min_longest_side = 1000
+         for t in tm.templates.values():
+             min_longest_side = min(min_longest_side, max(t.shape[:2]))
+             
+         expected_longest = min_longest_side / ratio
+         expected_max_size = max_tmpl_dim / ratio
+         
+         limit_max = int(expected_max_size * 2.0)
+         limit_strict_min = int(expected_longest * 0.90)
+         
+         limit_max = max(limit_max, 20)
+         limit_strict_min = max(limit_strict_min, 4)
+         
+         cand_max_w = limit_max
+         cand_max_h = limit_max
+    
+    # PROCESSING LOOP
+    for task in tasks:
+        img = task['img']
+        rot_name = task['rotation_name']
+        matrix = task['matrix']
+        t_doc = task['doc']
+        t_page = task['page']
+        
+        print(f"--- Processing {rot_name} ---")
+        
         try:
-            # Determine line removal threshold based on template size
-            # User request: "remove only lines ... at least 2x longer ... than the biggest template size"
-            line_len = 100 # Fallback default
-            
-            # We need to access expected_max_size. It was calculated in the setup phase if max_tmpl_dim > 0.
-            # To be safe and avoid scope issues, we can re-derive the logic or check locals.
-            # But better: Check if we have templates and calculate dynamically.
-            
+            line_len = 100
             if max_tmpl_dim > 0:
-                 # Re-calculate ratio valid for this run
                  ratio = 1.0
                  if not args.font and args.capture_zoom and args.zoom:
                      ratio = args.capture_zoom / args.zoom
-                     
                  curr_expected_max_size = max_tmpl_dim / ratio
                  line_len = int(curr_expected_max_size * 2.0)
-                 
-                 # Ensure it's not too small (e.g. if templates are tiny)
                  line_len = max(line_len, 50)
-                 print(f"DEBUG: Using line_len={line_len} (2 * MaxTmpl {int(curr_expected_max_size)})")
             elif doc is not None:
                  line_len = max(40, int(args.zoom * 10))
 
+            _, gray_img, binary_img = preprocess_from_array(img, min_line_length=line_len)
             
-            _, gray_img, binary_img = preprocess_from_array(orig_img, min_line_length=line_len)
+            # Candidates
+            raw_candidates = get_character_candidates(binary_img, min_w=cand_min_w, min_h=cand_min_h, max_w=cand_max_w, max_h=cand_max_h)
             
-            # DEBUG: Save binary image
-            cv2.imwrite(f"debug_binary_{suffix}.png", binary_img)
-            print(f"Saved debug_binary_{suffix}.png")
-        except Exception as e:
-            print(f"Error processing image section {suffix}: {e}")
-            continue
-
-        # 3. Get Candidates
-        raw_candidates = get_character_candidates(binary_img, min_w=cand_min_w, min_h=cand_min_h, max_w=cand_max_w, max_h=cand_max_h)
-        # Apply Strict Filter
-        candidates = []
-        if max_tmpl_dim > 0:
-            for c in raw_candidates:
-                longest = max(c['w'], c['h'])
-                ratio = c['h'] / float(c['w']) if c['w'] > 0 else 0
+            candidates = []
+            if max_tmpl_dim > 0:
+                for c in raw_candidates:
+                    longest = max(c['w'], c['h'])
+                    ratio = c['h'] / float(c['w']) if c['w'] > 0 else 0
+                    if longest >= limit_strict_min:
+                        candidates.append(c)
+                    elif longest >= limit_strict_min * 0.5 and ratio > 2.0:
+                        candidates.append(c)
+            else:
+                candidates = raw_candidates
                 
-                # 1. Standard Size Check
-                if longest >= limit_strict_min:
-                    candidates.append(c)
-                # 2. Rescue Small Thin Characters (e.g. '1', 'l', 'I')
-                # These might be smaller than the average letter but are valid if they are tall/thin.
-                # 'D' noise is usually blocky (ratio ~1.0-1.5), so checking ratio > 2.0 filters it out.
-                elif longest >= limit_strict_min * 0.5 and ratio > 2.0:
-                    candidates.append(c)
-        else:
-            candidates = raw_candidates
+            print(f"Found {len(candidates)} candidates.")
             
-        print(f"Found {len(candidates)} candidates.")
-        
-        # Optimize PDF High-Res Extraction (Only for 0 deg / original page)
-        high_res_img = None
-        zoom_ratio = 1.0
-        
-        if doc is not None and page_num is not None:
-            try:
-                # Render logic...
-                high_res_img = render_page(doc, page_num, zoom=args.capture_zoom)
-                if high_res_img is not None:
-                    high_res_img = cv2.cvtColor(high_res_img, cv2.COLOR_BGR2GRAY)
-                    _, high_res_img = cv2.threshold(high_res_img, 180, 255, cv2.THRESH_BINARY)
-                    zoom_ratio = args.capture_zoom / args.zoom
-            except Exception as e:
-                pass
-        
-        # 4. Match Candidates
-        matches = []
-        import time
-        start_time = time.time()
-        
-        for idx, cand in enumerate(candidates):
-            roi = None
-            if high_res_img is not None:
-                # Fast Crop Strategy for High Res
+            # High Res Setup
+            high_res_img_task = None
+            zoom_ratio = 1.0
+            
+            if t_doc is not None and t_page is not None:
                 try:
-                    x, y, w, h = cand['bbox']
-                    x_hi = int(x * zoom_ratio)
-                    y_hi = int(y * zoom_ratio)
-                    w_hi = int(w * zoom_ratio)
-                    h_hi = int(h * zoom_ratio)
-                    h_img, w_img = high_res_img.shape
-                    x_hi = max(0, min(x_hi, w_img - 1))
-                    y_hi = max(0, min(y_hi, h_img - 1))
-                    pad = 2
-                    x_hi = max(0, x_hi - pad)
-                    y_hi = max(0, y_hi - pad)
-                    w_hi = min(w_img - x_hi, w_hi + 2*pad)
-                    h_hi = min(h_img - y_hi, h_hi + 2*pad)
+                    high_res_img_task = render_page(t_doc, t_page, zoom=args.capture_zoom)
                     
-                    if w_hi > 0 and h_hi > 0:
-                        roi = high_res_img[y_hi:y_hi+h_hi, x_hi:x_hi+w_hi]
+                    # Apply Crop if args.crop exists
+                    if high_res_img_task is not None and args.crop:
+                         cx, cy, cw, ch = map(int, args.crop.split(','))
+                         ratio_crop = args.capture_zoom / args.zoom
+                         hcx, hcy = int(cx * ratio_crop), int(cy * ratio_crop)
+                         hcw, hch = int(cw * ratio_crop), int(ch * ratio_crop)
+                         hh, hw = high_res_img_task.shape[:2]
+                         hcx = max(0, min(hcx, hw))
+                         hcy = max(0, min(hcy, hh))
+                         hcw = min(hcw, hw - hcx)
+                         hch = min(hch, hh - hcy)
+                         if hcw > 0 and hch > 0:
+                             high_res_img_task = high_res_img_task[hcy:hcy+hch, hcx:hcx+hcw]
+
+                    if high_res_img_task is not None:
+                        high_res_img_task = cv2.cvtColor(high_res_img_task, cv2.COLOR_BGR2GRAY)
+                        _, high_res_img_task = cv2.threshold(high_res_img_task, 180, 255, cv2.THRESH_BINARY)
+                        zoom_ratio = args.capture_zoom / args.zoom
                 except:
                     pass
             
-            if roi is None:
-               roi = extract_candidate_roi(gray_img, cand)
-            
-            if roi is None or roi.size == 0:
-                continue
-
-            char, score, angle = match_character(roi, tm.templates, rotation_angles=[0])
-            
-            if score > 0.5:
-                # print(f"Match: {char} ({score:.2f}) at {cand['x']},{cand['y']}")
-                pass
-            elif score > 0.3:
-                 print(f"Low Score Match: {char} ({score:.2f}) at {cand['x']},{cand['y']} Size: {cand['w']}x{cand['h']}")
-            
-            if score > 0.5:
-                match_data = cand.copy()
-                match_data['char'] = char
-                match_data['score'] = score
-                match_data['angle'] = angle
-                matches.append(match_data)
-        
-        labels = group_characters(matches)
-        
-        # Filter (keep all but tag them) or keep only COMPONENT?
-        # User said "Show all extracted labels" usually means components + maybe unknowns? 
-        # But consistent with previous step, we likely care about components.
-        # Let's keep all valid detected labels for potential review
-        
-        print(f"Detected {len(labels)} labels in {rot_name} pass.")
-        
-        # TRANSFORM BACK TO ORIGINAL COORDINATES
-        for l in labels:
-            x, y, w, h = l['bbox']
-            # Create the 4 corners of the bbox
-            # (x, y) is top-left
-            pts = np.array([
-                [x, y],
-                [x + w, y],
-                [x + w, y + h],
-                [x, y + h]
-            ], dtype=np.float32)
-            
-            # Add extra dim for matrix mult
-            # pts array shape: (4, 2)
-            # We need to reshape to (4, 1, 2) for perspectiveTransform or just use manual math
-            
-            if matrix is not None:
-                # Invert the affine matrix
-                # matrix is 2x3. 
-                # OpenCV invertAffineTransform expects 2x3
-                inv_matrix = cv2.invertAffineTransform(matrix)
-                # transform points
-                original_pts = cv2.transform(np.array([pts]), inv_matrix)[0]
-            else:
-                original_pts = pts
-            
-            # Store data
-            # Convert to list of tuples for easier handling
-            poly_points = original_pts.astype(int).tolist()
-             
-            # Calculate a representative center for text listing
-            center_x = int(np.mean(original_pts[:, 0]))
-            center_y = int(np.mean(original_pts[:, 1]))
-            
-            page_results_map[page_id]['labels'].append({
-                'text': l['text'],
-                'type': l['type'],
-                'score': l['score'],
-                'rotation_found': rot_name,
-                'poly': poly_points,
-                'center': (center_x, center_y),
-                'bbox_local': (x,y,w,h) # debug info
-            })
-
-    # --- FINAL VISUALIZATION & SAVING ---
-    for p_id, res in page_results_map.items():
-        if 'orig_img' not in res:
-            print(f"Skipping page {p_id} (No base image found)")
-            continue
-            
-        base_vis = res['orig_img'].copy()
-        all_labels = res['labels']
-        base_path = res.get('base_filepath', 'output')
-        
-        print(f"Aggregation: Page {p_id} has {len(all_labels)} total detected labels.")
-        
-        # Prepare Text File
-        txt_path = f"{Path(base_path).stem}_page_{p_id+1}_COMBINED.txt"
-        with open(txt_path, "w") as f:
-            f.write(f"Combined Extraction Report for Page {p_id+1}\n")
-            f.write(f"Source: {base_path}\n")
-            f.write("Includes 0deg, 90deg CW, 45deg CCW passes.\n")
-            f.write("-" * 80 + "\n")
-            f.write(f"{'Label':<15} | {'Type':<5} | {'Conf':<5} | {'Found @':<8} | {'Center (x,y)'}\n")
-            f.write("-" * 80 + "\n")
-            
-            # Draw
-            
-            # --- NMS / Overlap Filtering ---
-            def get_poly_bbox(poly_pts):
-                arr = np.array(poly_pts)
-                x = np.min(arr[:,0])
-                y = np.min(arr[:,1])
-                w = np.max(arr[:,0]) - x
-                h = np.max(arr[:,1]) - y
-                return (x, y, w, h)
-
-            def compute_iou(boxA, boxB):
-                xA = max(boxA[0], boxB[0])
-                yA = max(boxA[1], boxB[1])
-                xB = min(boxA[0]+boxA[2], boxB[0]+boxB[2])
-                yB = min(boxA[1]+boxA[3], boxB[1]+boxB[3])
-                interArea = max(0, xB - xA) * max(0, yB - yA)
-                boxAArea = boxA[2] * boxA[3]
-                boxBArea = boxB[2] * boxB[3]
-                iou = interArea / float(boxAArea + boxBArea - interArea + 1e-6)
-                return iou
-
-            def filter_overlapping(labels, threshold=0.3):
-                # Sort by Priority: COMPONENT first, then Score
-                # We want to keep the best ones, so we sort descending
-                def priority(l):
-                    type_score = 1000 if l['type'] == 'COMPONENT' else 0
-                    return type_score + l['score']
+            # Match
+            matches = []
+            for idx, cand in enumerate(candidates):
+                roi = None
+                if high_res_img_task is not None:
+                    try:
+                        x, y, w, h = cand['bbox']
+                        x_hi, y_hi = int(x * zoom_ratio), int(y * zoom_ratio)
+                        w_hi, h_hi = int(w * zoom_ratio), int(h * zoom_ratio)
+                        h_img, w_img = high_res_img_task.shape
+                        pad = 2
+                        x_hi = max(0, x_hi - pad)
+                        y_hi = max(0, y_hi - pad)
+                        w_hi = min(w_img - x_hi, w_hi + 2*pad)
+                        h_hi = min(h_img - y_hi, h_hi + 2*pad)
+                        if w_hi > 0 and h_hi > 0:
+                            roi = high_res_img_task[y_hi:y_hi+h_hi, x_hi:x_hi+w_hi]
+                    except: pass
                 
-                sorted_indices = sorted(range(len(labels)), key=lambda i: priority(labels[i]), reverse=True)
-                keep = []
+                if roi is None:
+                     roi = extract_candidate_roi(gray_img, cand)
                 
-                for i in sorted_indices:
-                    current_poly = labels[i]['poly']
-                    current_box = get_poly_bbox(current_poly)
-                    
-                    is_overlap = False
-                    for k_idx in keep:
-                        kept_label = labels[k_idx]
-                        kept_box = get_poly_bbox(kept_label['poly'])
-                        
-                        if compute_iou(current_box, kept_box) > threshold:
-                            is_overlap = True
-                            break
-                            
-                    if not is_overlap:
-                        keep.append(i)
-                        
-                return [labels[i] for i in keep]
-
-            filtered_labels = filter_overlapping(all_labels, threshold=0.2)
-            print(f"NMS applied: Reduced {len(all_labels)} -> {len(filtered_labels)} labels.")
-            all_labels = filtered_labels
+                if roi is None or roi.size == 0: continue
+                
+                char, score, angle = match_character(roi, tm.templates, rotation_angles=[0])
+                if score > 0.5:
+                    match_data = cand.copy()
+                    match_data['char'] = char
+                    match_data['score'] = score
+                    match_data['angle'] = angle
+                    matches.append(match_data)
             
-            for l in all_labels:
-                poly = np.array(l['poly'], dtype=np.int32)
+            task_labels = group_characters(matches)
+            print(f"Detected {len(task_labels)} labels in {rot_name}.")
+            
+            # Transform Back
+            for l in task_labels:
+                x, y, w, h = l['bbox']
+                pts = np.array([[x, y],[x + w, y],[x + w, y + h],[x, y + h]], dtype=np.float32)
                 
-                # Color Coding
-                if l['type'] == 'COMPONENT':
-                    color = (0, 255, 0) # Green
-                    thick = 2
+                if matrix is not None:
+                    inv_matrix = cv2.invertAffineTransform(matrix)
+                    original_pts = cv2.transform(np.array([pts]), inv_matrix)[0]
                 else:
-                    color = (0, 165, 255) # Orange for unknown
-                    thick = 1
+                    original_pts = pts
                 
-                # Draw Polygon
-                cv2.polylines(base_vis, [poly], isClosed=True, color=color, thickness=thick)
+                poly_points = original_pts.astype(int).tolist()
+                center_x = int(np.mean(original_pts[:, 0]))
+                center_y = int(np.mean(original_pts[:, 1]))
                 
-                # Put Text at the top-left-ish corner (first point) or center
-                txt_pos = tuple(l['poly'][0])    
-                # Ensure text is on screen?
-                
-                cv2.putText(base_vis, l['text'], txt_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4) # outline
-                cv2.putText(base_vis, l['text'], txt_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-                
-                # Write to file
-                f.write(f"{l['text']:<15} | {('CP' if l['type']=='COMPONENT' else '?'):<5} | {l['score']:.2f} | {l['rotation_found']:<8} | {l['center']}\n")
-                
-        # Save Image
-        out_img_path = f"{Path(base_path).stem}_page_{p_id+1}_COMBINED.png"
-        cv2.imwrite(out_img_path, base_vis)
-        print(f"Saved Combined Text: {txt_path}")
-        print(f"Saved Combined Image: {out_img_path}")
+                all_labels.append({
+                    'text': l['text'],
+                    'type': l['type'],
+                    'score': l['score'],
+                    'rotation_found': rot_name,
+                    'poly': poly_points,
+                    'center': (center_x, center_y),
+                    'bbox_local': (x,y,w,h)
+                })
+
+        except Exception as e:
+            print(f"Error in {rot_name}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # NMS Filtering on accumulated labels
+    def get_poly_bbox(poly_pts):
+        arr = np.array(poly_pts)
+        x = np.min(arr[:,0])
+        y = np.min(arr[:,1])
+        w = np.max(arr[:,0]) - x
+        h = np.max(arr[:,1]) - y
+        return (x, y, w, h)
+
+    def compute_iou(boxA, boxB):
+        xA, yA = max(boxA[0], boxB[0]), max(boxA[1], boxB[1])
+        xB, yB = min(boxA[0]+boxA[2], boxB[0]+boxB[2]), min(boxA[1]+boxA[3], boxB[1]+boxB[3])
+        interArea = max(0, xB - xA) * max(0, yB - yA)
+        boxAArea = boxA[2] * boxA[3]
+        boxBArea = boxB[2] * boxB[3]
+        return interArea / float(boxAArea + boxBArea - interArea + 1e-6)
+
+    def filter_overlapping(labels, threshold=0.2):
+        def priority(l): return (1000 if l['type'] == 'COMPONENT' else 0) + l['score']
+        sorted_indices = sorted(range(len(labels)), key=lambda i: priority(labels[i]), reverse=True)
+        keep = []
+        for i in sorted_indices:
+            current_poly = labels[i]['poly']
+            current_box = get_poly_bbox(current_poly)
+            is_overlap = False
+            for k_idx in keep:
+                kept_box = get_poly_bbox(labels[k_idx]['poly'])
+                if compute_iou(current_box, kept_box) > threshold:
+                    is_overlap = True; break
+            if not is_overlap: keep.append(i)
+        return [labels[i] for i in keep]
+
+    final_labels = filter_overlapping(all_labels)
+    
+    # VISUALIZATION
+    if visualize:
+        base_vis = base_img.copy()
+        for l in final_labels:
+            poly = np.array(l['poly'], dtype=np.int32)
+            color = (0, 255, 0) if l['type'] == 'COMPONENT' else (0, 165, 255)
+            thick = 2 if l['type'] == 'COMPONENT' else 1
+            cv2.polylines(base_vis, [poly], isClosed=True, color=color, thickness=thick)
+            
+            # Calculate optimal text position
+            txt_pos = tuple(l['poly'][0])    
+            cv2.putText(base_vis, l['text'], txt_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4) # outline
+            cv2.putText(base_vis, l['text'], txt_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         
-        # Show
-        max_h = 900
-        h_vis, w_vis = base_vis.shape[:2]
-        if h_vis > max_h:
-             scale = max_h / h_vis
-             vis_disp = cv2.resize(base_vis, None, fx=scale, fy=scale)
-        else:
-             vis_disp = base_vis
-             
-        title = f"Combined Results Page {p_id+1}"
-        cv2.imshow(title, vis_disp)
+        title = f"Combined Results {base_suffix}"
+        cv2.imshow(title, base_vis)
         print("Press any key to close...")
         cv2.waitKey(0)
         cv2.destroyWindow(title)
-
+    
+    return final_labels
 
 if __name__ == "__main__":
     main()

@@ -73,3 +73,23 @@ def _pixmap_to_bgr(pix):
         img_bgr = cv2.cvtColor(img_data, cv2.COLOR_GRAY2BGR)
         
     return img_bgr
+
+def extract_words_from_page(doc, page_num):
+    """
+    Extracts text words from a specific page.
+    Args:
+        doc: fitz.Document
+        page_num: int, 0-indexed
+    Returns:
+        list of strings (words)
+    """
+    if page_num < 0 or page_num >= len(doc):
+        return []
+        
+    page = doc.load_page(page_num)
+    # get_text("words") returns list of (x0, y0, x1, y1, "word", block_no, line_no, word_no)
+    words_info = page.get_text("words")
+    
+    # We only care about the text content for now
+    words = [w[4] for w in words_info]
+    return words

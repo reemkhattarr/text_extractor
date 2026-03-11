@@ -1,9 +1,11 @@
-﻿import cv2
-import argparse
+﻿import argparse
 import os
+import sys
 import string
 import numpy as np
 import time
+import cv2
+import subprocess
 import tkinter as tk
 from tkinter import filedialog
 from pathlib import Path
@@ -11,8 +13,16 @@ import ctypes # For cursor manipulation
 
 
 # Try importing PDF loader logic
+# Try importing PDF loader logic
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
+import json
 try:
     from pdf_loader import load_pdf, render_page, render_clip
+    from main import process_page_system, TemplateManager
     PDF_AVAILABLE = True
 except ImportError:
     PDF_AVAILABLE = False
@@ -35,17 +45,19 @@ except ImportError as e:
     print(f"Warning: Could not import detection modules: {e}")
 
 class TemplateTrainer:
-    def __init__(self, output_dir="templates", debug_page=None):
-        self.output_dir = output_dir
-        self.debug_page = debug_page
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
+    def __init__(self, debug_page=None):
+        # We now manage two potential directories
+        self.dirs = {
+            "TOPOGRAPHIC": "placement_templates",
+            "ELECTRICAL": "schematics_templates"
+        }
+        for d in self.dirs.values():
+            if not os.path.exists(d):
+                os.makedirs(d)
 
-        # Set scale tolerance based on mode
-        # Schematics require stricter tolerance (20%) because text sizes vary and templates are small.
-        # Placements allow looser tolerance (50%) as validated previously.
-        self.scale_tolerance = 0.20 if "schematic" in output_dir else 0.50
-        print(f"Scale Tolerance set to {self.scale_tolerance}")
+        self.output_dir = None # Set when type is selected
+        self.debug_page = debug_page
+        self.scale_tolerance = 0.5 # Default (will change)
 
         # State
         self.running = True
@@ -55,7 +67,9 @@ class TemplateTrainer:
         self.current_page = 0
         self.total_pages = 0
         
-        self.original_page_img = None # The clean render of the page (High detail base)
+        self.original_page_img = None # The active image (cropped or full)
+        self.full_page_img = None # The full render of the page (backup for reset)
+        self.page_crop_rect = None # (x, y, w, h) of crop relative to full page
         
         # Viewport State
         self.view_scale = 1.0 # Display zoom level
@@ -112,7 +126,7 @@ class TemplateTrainer:
         self.grid_coords = {} # char -> (x, y, w, h)
 
         # UI Config
-        self.window_name = "Template Trainer"
+        self.window_name = "Template Trainer (DB Mode)"
         self.sidebar_width = 300
         self.header_height = 60
         self.min_height = 800
@@ -138,11 +152,28 @@ class TemplateTrainer:
             'btn_active': (120, 120, 130),
             'btn_finish': (40, 150, 80),
             'btn_finish_hover': (60, 180, 100),
+            'btn_save': (0, 120, 215), # Blue for Save DB
+            'btn_save_hover': (0, 140, 240),
             'grid_bg': (65, 65, 70),
             'grid_border': (80, 80, 90),
             'grid_exists': (80, 80, 80), # Grey for existing (was Greenish)
             'grid_session': (80, 140, 80), # Green for current session
         }
+
+        # API Config
+        self.api_base_url = "http://localhost:5090/ipc"
+        self.offline_mode = False
+        self.board_name = None
+        self.board_id = None
+        self.placements_processed = 0
+        self.schematics_processed = 0
+        
+        # Session State for Page Type
+        self.page_type = None # "TOPOGRAPHIC" or "ELECTRICAL"
+        self.page_side = None # "TOP" or "BOTTOM" (Only for Placement)
+
+        # Prompt for Board Name
+        self.prompt_board_name()
 
         # Load initial file list
         self.refresh_file_list()
@@ -179,6 +210,86 @@ class TemplateTrainer:
         # Mouse Callback
         cv2.namedWindow(self.window_name)
         cv2.setMouseCallback(self.window_name, self.mouse_callback)
+
+    def prompt_board_name(self):
+        """ prompts user for board name via popup and creates it on backend """
+        root = tk.Tk()
+        root.withdraw()
+        
+        from tkinter import simpledialog, messagebox
+        
+        while True:
+            board_name = simpledialog.askstring("Board Setup", "Enter Board Name:", parent=root)
+            
+            if not board_name:
+                print("Board name required. Exiting.")
+                sys.exit(0)
+            
+            self.board_name = board_name
+            
+            # Check Server Connectivity
+            if not REQUESTS_AVAILABLE:
+                self.offline_mode = True
+                print("Stats: Offline Mode (Requests library missing).")
+                self.board_id = "OFFLINE_BOARD"
+                break
+                
+            try:
+                print(f"Creating board '{board_name}'...")
+                resp = requests.post(f"{self.api_base_url}/board", json={"name": board_name})
+                
+                if resp.status_code == 201 or resp.status_code == 200:
+                    data = resp.json()
+                    self.board_id = data['id']
+                    # self.board_name = data['name'] # Already set
+                    print(f"Board Created: ID={self.board_id}, Name={self.board_name}")
+                    break
+                else:
+                    err = resp.json().get('error', 'Unknown Error')
+                    # If board exists, maybe we just use it? 
+                    if "already exists" in err.lower():
+                        if messagebox.askyesno("Board Exists", f"Board '{board_name}' already exists. Use it?"):
+                             # Try to get boards list and find ID
+                             try:
+                                 print("Fetching existing board ID...")
+                                 boards_resp = requests.get(f"{self.api_base_url}/boards")
+                                 if boards_resp.status_code == 200:
+                                     all_boards = boards_resp.json()
+                                     found = next((b for b in all_boards if b['name'] == board_name), None)
+                                     if found:
+                                         self.board_id = found['id']
+                                         print(f"Using Existing Board: ID={self.board_id}")
+                                         break
+                                     else:
+                                         print("Board exists but not found in list??")
+                             except Exception as e:
+                                 print(f"Failed to fetch boards: {e}")
+                             
+                             # If we failed to get ID but user wants to use it, maybe default to offline or warning?
+                             if not self.board_id:
+                                  messagebox.showwarning("Error", "Could not retrieve ID for existing board. \nPlease check server or try a new name.")
+                                  continue
+
+                    if not self.board_id:
+                        if messagebox.askyesno("API Error", f"Server returned: {err}\n\nContinue in OFFLINE MODE?"):
+                            self.offline_mode = True
+                            self.board_id = "OFFLINE_BOARD"
+                            break
+                        else:
+                            continue # Retry name
+            except Exception as e:
+                print(f"Connection Failed: {e}")
+                if messagebox.askyesno("Connection Error", f"Could not connect to server.\n\nContinue in OFFLINE MODE?"):
+                    self.offline_mode = True
+                    self.board_id = "OFFLINE_BOARD"
+                    break
+                else:
+                    sys.exit(1)
+        
+        try:
+            root.destroy()
+        except:
+            pass
 
 # ... inside draw_sidebar ...
 
@@ -325,7 +436,7 @@ class TemplateTrainer:
         # Instead, we define a "Min Longest Side".
         # For "1" (10x50), Longest=50. For Hole (20x25), Longest=25.
         
-        # Calculate min of max_dims
+        # Calculate min
         min_longest_side = 1000
         for f in os.listdir(self.output_dir):
             if f.endswith(".png"):
@@ -360,6 +471,56 @@ class TemplateTrainer:
             print("No templates found in output directory.")
             return
 
+        print("Launching Main Detection Process (In-Memory)...")
+        
+        # We need to construct a mock args object
+        output_dir_ref = self.output_dir # Capture for closure
+        class MockArgs:
+            def __init__(self):
+                self.zoom = 8.0 # Match our view
+                self.capture_zoom = 24.0
+                self.crop = None # Image is already cropped!
+                self.font = False
+                self.templates = output_dir_ref
+                self.image_path = "In-Memory-Crop"
+        
+        args = MockArgs()
+        
+        # Load Template Manager
+        tm = TemplateManager()
+        tm.load_templates_from_dir(self.output_dir)
+        
+        try:
+             # Run logic directly
+             labels = process_page_system(
+                 base_img=self.original_page_img,
+                 doc=self.pdf_doc,
+                 page_num_0based=self.current_page,
+                 tm=tm,
+                 args=args,
+                 base_suffix="_session_crop",
+                 visualize=False
+             )
+             print(f"Direct Run Complete. Found {len(labels)} labels.")
+             
+             # Populate matched_instances for saving
+             self.matched_instances = []
+             for l in labels:
+                 x, y, w, h = l['bbox_local']
+                 self.matched_instances.append((x, y, w, h, l['text']))
+             
+             # Force redraw of right viewport
+             self.update_view_fit() 
+             
+        except Exception as e:
+            print(f"Failed to run detection: {e}")
+            import traceback
+            traceback.print_exc()
+            
+        return
+
+        # OLD LOGIC DISABLED
+        """
         self.is_processing = True
         self.detected_matches = []
         print("Starting detection process using candidate extraction...")
@@ -449,6 +610,7 @@ class TemplateTrainer:
 
         self.is_processing = False
         print(f"Detection complete. Found {len(self.detected_matches)} matches.")
+        """
 
     def detection_mouse_callback(self, event, x, y, flags, param):
         """Separate callback for the detection results window."""
@@ -517,14 +679,15 @@ class TemplateTrainer:
         # but handled efficiently.
         base_zoom = 8.0 
         print(f"Rendering page {self.current_page+1} at zoom {base_zoom}...")
-        self.original_page_img = render_page(self.pdf_doc, self.current_page, zoom=base_zoom)
+        raw_img = render_page(self.pdf_doc, self.current_page, zoom=base_zoom)
         
         # Sharpen / Binarize to remove gray pixels
-        if self.original_page_img is not None:
-             gray = cv2.cvtColor(self.original_page_img, cv2.COLOR_BGR2GRAY)
+        if raw_img is not None:
+             gray = cv2.cvtColor(raw_img, cv2.COLOR_BGR2GRAY)
              # Threshold to make it strictly Black and White
              _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
-             self.original_page_img = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
+             self.full_page_img = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
+             # self.original_page_img = self.full_page_img.copy() # Start with full
         
         # Reset Selection
         self.confirmed_rect = None
@@ -533,44 +696,25 @@ class TemplateTrainer:
         self.detected_matches = []
         self.show_detections = False
         
+        # Reset Crop State
+        self.page_crop_rect = None
+        self.selection_mode = "CROP" # Force crop mode on new page
+        print("Entering Crop Mode. Please select the area to process.")
+        
         # Reset Real-time Detection
         self.active_search_char = None
         self.matched_instances = []
         self.page_candidates = []
         
         # Pre-compute candidates for this page to speed up interactive search
-        if self.original_page_img is not None:
-            if self.debug_page is not None and self.current_page == self.debug_page:
-                 # If debug page is set, we DO compute immediately to show debug info
-                self.ensure_candidates_computed()
-            else:
-                 self.page_candidates = [] # Lazy load
-                 print("Candidates cleared (Lazy Mode).")
+        if self.full_page_img is not None:
+            # Lazy load candidates only if NOT in crop mode (or defer until crop confirmed)
+            # We defer candidate computation until after crop to avoid wasting time on noise
+            self.page_candidates = [] 
+            print("Candidates cleared (Waiting for crop).")
         
-        # Calc Zoom-to-Fit
-        if self.original_page_img is not None:
-            ph, pw = self.original_page_img.shape[:2]
-            
-            # Viewport size (Approximate, simplified calc for split view)
-            # We target ~800px width for the left viewport
-            view_w = 800 
-            view_h = 900 - self.header_height
-            
-            scale_w = view_w / pw
-            scale_h = view_h / ph
-            
-            # Left Viewport (Interactive) - Fit initially
-            self.min_scale = min(scale_w, scale_h) * 0.95 
-            self.view_scale = self.min_scale 
-            
-            # Center Left
-            self.view_offset_x = (view_w - pw * self.view_scale) / 2
-            self.view_offset_y = (view_h - ph * self.view_scale) / 2
-            
-            # Right Viewport (Stable) - Fit Always
-            self.right_view_scale = self.min_scale
-            self.right_view_offset_x = (view_w - pw * self.right_view_scale) / 2
-            self.right_view_offset_y = (view_h - ph * self.right_view_scale) / 2
+        # Apply crop if exists (e.g. persisted?) - usually None on new page
+        self.refresh_page_image()
 
     def ensure_candidates_computed(self):
         """Computes candidates for the current page if not already done."""
@@ -623,7 +767,22 @@ class TemplateTrainer:
             print(f"No template found for {char_key}")
             return
             
-        tmpl = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        # Check file size before loading to avoid CV_IO_MAX_IMAGE_PIXELS crash
+        # If file is gigantic (> 5MB for a single char template is wrong), skip
+        try:
+            fsize = os.path.getsize(path)
+            if fsize > 1024 * 1024 * 5: # 5MB limit
+                 print(f"Warning: Template {char_key} is too large ({fsize} bytes). Skipping.")
+                 return
+        except:
+             return
+
+        try:
+             tmpl = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        except Exception as e:
+             print(f"Failed to load template {char_key}: {e}")
+             return
+
         if tmpl is None: return
         
         templates = {char_key: tmpl}
@@ -885,24 +1044,44 @@ class TemplateTrainer:
             if found_hover == "OPEN_PDF":
                 self.load_pdf_dialog()
             elif found_hover == "PREV_PAGE":
-                self.change_page(-1)
+                 if not self.page_crop_rect: self.change_page(-1)
             elif found_hover == "NEXT_PAGE":
-                self.change_page(1)
+                 if not self.page_crop_rect: self.change_page(1)
             elif found_hover == "MODE_SWITCH":
-                if self.selection_mode == "RECT": self.selection_mode = "SELECT"
-                else: self.selection_mode = "RECT"
-                self.confirmed_rect = None
-                self.editing_image = None
-                self.input_char = ""
-                self.selection_start = None
-                self.selection_current = None
-                self.selecting = False
-                print(f"Mode switched to {self.selection_mode}")
+                # Disable mode switch if in CROP
+                if self.selection_mode == "CROP":
+                    print("Cannot switch mode while cropping. Please Confirm Crop first.")
+                else:
+                    if self.selection_mode == "RECT": self.selection_mode = "SELECT"
+                    else: self.selection_mode = "RECT"
+                    self.confirmed_rect = None
+                    self.editing_image = None
+                    self.input_char = ""
+                    self.selection_start = None
+                    self.selection_current = None
+                    self.selecting = False
+                    print(f"Mode switched to {self.selection_mode}")
             elif found_hover == "FINISH":
-                self.running = False
+                if self.placements_processed >= 1 and self.schematics_processed >= 1:
+                    self.running = False
+                else:
+                    print("Cannot Finish: Need at least 1 Placement and 1 Schematic saved.")
+            elif found_hover == "CONFIRM_CROP":
+                self.apply_crop()
+            elif found_hover == "RESET_CROP":
+                self.reset_crop()
             elif found_hover == "PROCESS":
                 if not self.is_processing:
                     self.detect_session_templates()
+            elif found_hover == "SET_TYPE_TOP":
+                self.set_page_type("TOPOGRAPHIC", "TOP")
+            elif found_hover == "SET_TYPE_BOT":
+                self.set_page_type("TOPOGRAPHIC", "BOTTOM")
+            elif found_hover == "SET_TYPE_SCHEM":
+                self.set_page_type("ELECTRICAL", None)
+
+            elif found_hover == "SAVE_DB":
+                self.save_current_work()
             return # Hit a button, stop processing
 
         # --- Viewport Interactions ---
@@ -965,7 +1144,7 @@ class TemplateTrainer:
                         safe_w = min(self.original_page_img.shape[1] - safe_rx, rw)
                         safe_h = min(self.original_page_img.shape[0] - safe_ry, rh)
                         if safe_w > 0 and safe_h > 0:
-                            roi = self.original_page_img[safe_ry:safe_ry+safe_h, safe_rx:safe_rx+safe_w]
+                            roi = self.original_page_img[safe_ry:safe_ry+safe_h, safe_rx:safe_w+safe_h]
                             self.input_char = self.predict_char(roi)
             return
 
@@ -990,7 +1169,7 @@ class TemplateTrainer:
             
             # Selection Start
             elif event == cv2.EVENT_LBUTTONDOWN:
-                 if self.selection_mode == "RECT":
+                 if self.selection_mode in ["RECT", "CROP"]:
                     self.confirmed_rect = None
                     self.editing_image = None
                     self.rotation_angle = 0
@@ -1097,9 +1276,25 @@ class TemplateTrainer:
         cv2.rectangle(canvas, (90, 60), (105, 75), self.colors['grid_bg'], -1)
         cv2.putText(canvas, "To Add", (115, 72), font, 0.4, self.colors['text_dim'], 1)
         
+        if self.selection_mode == "CROP":
+             cv2.putText(canvas, "CROP PAGE Mode", (20, 90), font, 0.5, (50, 200, 255), 1)
+             cv2.putText(canvas, "Select Area", (20, 105), font, 0.4, self.colors['text_dim'], 1)
+             
+             if self.confirmed_rect:
+                 draw_btn_imp("CONFIRM_CROP", 20, 120, 160, 40, "CONFIRM CROP", self.colors['btn_finish'], self.colors['btn_finish_hover'])
+             
+             # Skip the rest of sidebar in crop mode
+             return
+             
         # Mode Toggle
         mode_label = f"Mode: {self.selection_mode}"
         draw_btn_imp("MODE_SWITCH", 20, 80, 160, 25, mode_label, self.colors['btn_def'], self.colors['btn_hover'])
+        
+        # Reset Crop Button (Only if not cropped)
+        if not self.page_crop_rect:
+            draw_btn_imp("RESET_CROP", 190, 80, 80, 25, "Reset Crop", (60, 40, 40), (80, 50, 50))
+        
+        # Remove CROP LOCKED as requested
 
         # Buttons will be drawn after grids to be dynamic
 
@@ -1194,6 +1389,9 @@ class TemplateTrainer:
         start_x = 20
         self.ui_list_chars = {} # Clear cache
         
+        start_x = 20
+        self.ui_list_chars = {} # Clear cache
+        
         def draw_grid(chars, offset_y):
             for i, char in enumerate(chars):
                 row = i // cols_per_row
@@ -1240,11 +1438,351 @@ class TemplateTrainer:
         # Process Button
         proc_col = (180, 100, 40) # Orange-ish
         proc_hover = (200, 120, 60)
-        draw_btn_imp("PROCESS", 20, btn_start_y, 160, 40, "PROCESS", proc_col, proc_hover)
+        
+        # --- Page Type Selector Buttons ---
+        type_y = btn_start_y
+        
+        # Toggle Colors based on selection
+        def get_type_color(ptype, pside=None):
+            is_selected = (self.page_type == ptype)
+            if pside:
+                is_selected = is_selected and (self.page_side == pside)
+            
+            if is_selected:
+                return (0, 180, 0) # Green for selected
+            return (60, 60, 65) # Dark Grey
+
+        draw_btn_imp("SET_TYPE_TOP", 20, type_y, 80, 40, "PLACE TOP", get_type_color("TOPOGRAPHIC", "TOP"), (80, 80, 90))
+        draw_btn_imp("SET_TYPE_BOT", 110, type_y, 80, 40, "PLACE BOT", get_type_color("TOPOGRAPHIC", "BOTTOM"), (80, 80, 90))
+        
+        draw_btn_imp("SET_TYPE_SCHEM", 20, type_y + 50, 170, 40, "SCHEMATICS", get_type_color("ELECTRICAL"), (80, 80, 90))
+        
+        # Process Button (Moved down)
+        btn_process_y = type_y + 110
+        draw_btn_imp("PROCESS", 20, btn_process_y, 160, 40, "PROCESS", proc_col, proc_hover)
+
+        # Save to DB Button (New)
+        db_y = btn_process_y + 50
+        draw_btn_imp("SAVE_DB", 20, db_y, 160, 40, "SAVE & NEXT", self.colors['btn_save'], self.colors['btn_save_hover'])
 
         # Finish Button
-        fin_y = btn_start_y + 50
-        draw_btn_imp("FINISH", 20, fin_y, 160, 40, "FINISH", self.colors['btn_finish'], self.colors['btn_finish_hover'])
+        fin_y = db_y + 50
+        
+        # Disable Finish if not ready
+        can_finish = (self.placements_processed >= 1 and self.schematics_processed >= 1)
+        fin_col = self.colors['btn_finish'] if can_finish else (60, 60, 60)
+        draw_btn_imp("FINISH", 20, fin_y, 160, 40, "FINISH", fin_col, self.colors['btn_finish_hover'])
+        
+        # ID Display
+        cv2.putText(canvas, f"Board: {self.board_name}", (20, fin_y + 60), font, 0.4, (200, 200, 200), 1)
+        stats = f"Placed: {self.placements_processed} | Schem: {self.schematics_processed}"
+        cv2.putText(canvas, stats, (20, fin_y + 80), font, 0.4, (200, 200, 200), 1)
+    
+        # Draw Buttons below grid
+        btn_start_y = final_y + 30
+           
+    def refresh_page_image(self):
+        """Updates the working image (self.original_page_img) based on crop."""
+        if self.full_page_img is None:
+            self.original_page_img = None
+            return
+
+        if self.page_crop_rect:
+            rx, ry, rw, rh = self.page_crop_rect
+            h, w = self.full_page_img.shape[:2]
+            
+            # Safe Slice
+            y1, y2 = max(0, int(ry)), min(h, int(ry+rh))
+            x1, x2 = max(0, int(rx)), min(w, int(rx+rw))
+            
+            if x2 > x1 and y2 > y1:
+                self.original_page_img = self.full_page_img[y1:y2, x1:x2].copy()
+            else:
+                self.original_page_img = self.full_page_img.copy() # Fallback
+        else:
+            self.original_page_img = self.full_page_img.copy()
+            
+        # Reset Viewport to fit the new "original" image (which is now the crop)
+        self.update_view_fit()
+        
+        # Clear detections as they are now invalid (coordinate shift)
+        self.matched_instances = [] 
+        self.detection_full_img = None
+        """Applies the current selection as the page crop."""
+        if self.confirmed_rect and self.full_page_img is not None:
+             x, y, w, h = self.confirmed_rect
+             
+             # Validate bounds
+             ph, pw = self.full_page_img.shape[:2]
+             x = max(0, min(x, pw))
+             y = max(0, min(y, ph))
+             w = min(w, pw - x)
+             h = min(h, ph - y)
+             
+             if w < 10 or h < 10:
+                 print("Crop too small.")
+                 return
+                 
+             self.page_crop_rect = (x, y, w, h)
+             # self.original_page_img = self.full_page_img[y:y+h, x:x+w].copy()
+             
+             # Reset View & Detection State
+             self.confirmed_rect = None
+             self.selection_start = None
+             self.selection_current = None
+             self.selecting = False
+             
+             self.selection_mode = "RECT"
+             self.detected_matches = [] # Clear old full-page matches
+             self.matched_instances = []
+             self.page_candidates = [] # Force re-calculation on cropped area
+             
+             self.refresh_page_image() # Update original_page_img and view
+             print(f"Page cropped to {self.page_crop_rect}")
+             self.refresh_file_list()
+
+    def reset_crop(self):
+        """Resets the page to full image."""
+        if self.full_page_img is not None:
+            self.page_crop_rect = None
+            self.refresh_page_image()
+            self.selection_mode = "CROP"
+            self.confirmed_rect = None
+            self.update_view_fit()
+            print("Crop reset. Entering Crop Mode.")
+
+    def save_current_work(self):
+        """ Saves current crop and detections based on selected Page Type. Handles offline mode. """
+        """Saves the current crop and components using selected Type (Top/Bot/Schem)"""
+        if not self.page_crop_rect:
+            print("No crop to save!")
+            return
+            
+        if self.page_type is None:
+            import tkinter as tk
+            from tkinter import messagebox
+            root = tk.Tk(); root.withdraw()
+            messagebox.showwarning("Select Type", "Please select a Page Type (Placement Top/Bot or Schematics) from the sidebar before saving!")
+            root.destroy()
+            return
+            
+        # --- AUTO-DETECT LOGIC FOR SCHEMATICS ---
+        # If no components selected/detected, but we have templates, try auto-detecting now.
+        if not self.matched_instances and self.page_type == "ELECTRICAL" and self.existing_files:
+             print("Auto-detecting components before save (Schematics Mode)...")
+             self.detect_session_templates()
+
+        if not self.matched_instances:
+            print("No components detected to save!")
+            return
+
+        print(f"Saving as {self.page_type} ({self.page_side})...")
+        
+        # Prepare Image Data
+        import io
+        from PIL import Image
+        
+        # Convert BGR to RGB
+        img_rgb = cv2.cvtColor(self.original_page_img, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(img_rgb)
+        
+        # Compress to PNG
+        img_byte_arr = io.BytesIO()
+        pil_img.save(img_byte_arr, format='PNG')
+        img_byte_arr.seek(0)
+        img_bytes = img_byte_arr.getvalue()
+        
+        h, w = self.original_page_img.shape[:2]
+        
+        # Prepare Component Data
+        components = []
+        layer_id = 0
+        if self.page_type == "TOPOGRAPHIC":
+            layer_id = 1 if self.page_side == "TOP" else 0
+        
+        # For Schematics, layer_id is 0 (or irrelevant)
+            
+        for (x, y, w_box, h_box, label) in self.matched_instances:
+            cx = x + w_box // 2
+            cy = y + h_box // 2
+            components.append({
+                "name": label,
+                "layer_id": layer_id,
+                "x": cx,
+                "y": cy,
+                "rotation": None,
+                "package_id": None
+            })
+        
+        # --- SAVE LOGIC ---
+        if self.offline_mode:
+            self.save_offline(img_bytes, w, h, components)
+        else:
+            self.save_online(img_bytes, w, h, components)
+            
+        # Reset state to full page view (like opening PDF) per user request
+        print("Save complete. Resetting to full page view...")
+        self.reset_crop()
+
+    def save_offline(self, img_bytes, w, h, components):
+        """ Appends data to local JSON file """
+        import base64
+        import time
+        import json
+        
+        filename = "offline_data.json"
+        
+        entry = {
+            "timestamp": time.time(),
+            "board_name": self.board_name,
+            "page_type": self.page_type,
+            "page_side": self.page_side,
+            "image_w": w,
+            "image_h": h,
+            # "image_b64": base64.b64encode(img_bytes).decode('utf-8'), # Optional: Save image? Might be huge.
+            # User said "save the things in a text file". Saving components is most critical.
+            # Saving image bytes to JSON is bad practice usually, maybe save to separate file?
+            # Let's save components primarily.
+            "components": components
+        }
+        
+        # If user wants image, save to distinct file
+        img_filename = f"offline_crop_{self.board_name}_{int(time.time())}.png"
+        with open(img_filename, "wb") as f:
+            f.write(img_bytes)
+        entry["image_file"] = img_filename
+        
+        try:
+            data = []
+            if os.path.exists(filename):
+                try:
+                    with open(filename, "r") as f:
+                        data = json.load(f)
+                except: data = []
+            
+            data.append(entry)
+            
+            with open(filename, "w") as f:
+                json.dump(data, f, indent=2)
+                
+            print(f"Offline Save Successful: {len(components)} components saved to {filename}")
+            
+            if self.page_type == "TOPOGRAPHIC":
+                self.placements_processed += 1
+            else:
+                self.schematics_processed += 1
+                
+        except Exception as e:
+            print(f"Failed to save offline: {e}")
+
+    def save_online(self, img_bytes, w, h, components):
+        try:
+            # 1. Upload Crop
+            files = {'file': ('crop.png', img_bytes, 'image/png')}
+            data = {
+                'board_id': self.board_id,
+                'function': self.page_type,
+                'h': h,
+                'w': w
+            }
+            if self.page_side:
+                data['side'] = self.page_side
+                
+            print("Uploading image to DB...")
+            resp = requests.post(f"{self.api_base_url}/crop_schematic", files=files, data=data, timeout=5)
+            
+            if resp.status_code != 201 and resp.status_code != 200:
+                print(f"Error uploading crop: {resp.text}")
+                # Switch to offline?
+                return
+                
+            # 2. Upload Components
+            if self.page_type == "TOPOGRAPHIC":
+                count = 0
+                for comp in components:
+                    c_resp = requests.post(f"{self.api_base_url}/component", json=comp, timeout=2)
+                    if c_resp.status_code == 201 or c_resp.status_code == 200:
+                        count += 1
+                    else:
+                        print(f"Failed to save {comp['name']}: {c_resp.text}")
+                
+                print(f"Saved {count} components.")
+                self.placements_processed += 1
+            else:
+                self.schematics_processed += 1
+                print("Schematic saved.")
+                
+            print(f"Progress: Placements={self.placements_processed}, Schematics={self.schematics_processed}")
+            
+        except Exception as e:
+            print(f"Online Save Failed: {e}")
+            import tkinter as tk
+            from tkinter import messagebox
+            root = tk.Tk(); root.withdraw()
+            if messagebox.askyesno("Connection Lost", "Connection to server failed. Switch to OFFLINE MODE and save locally?"):
+                self.offline_mode = True
+                root.destroy()
+                self.save_offline(img_bytes, w, h, components)
+            else:
+                root.destroy()
+
+    def set_page_type(self, ptype, pside=None):
+        """ Switches context to the selected page type """
+        self.page_type = ptype
+        self.page_side = pside
+        
+        # 1. Set Output Dir
+        self.output_dir = self.dirs.get(ptype, "templates")
+        
+        # 2. Set Tolerance
+        # Schematics require stricter tolerance (20%)
+        # Placements allow looser tolerance (50%)
+        if ptype == "ELECTRICAL":
+            self.scale_tolerance = 0.20
+        else:
+            self.scale_tolerance = 0.50
+            
+        print(f"Switched to {ptype} ({pside}). Dir: {self.output_dir}, Tol: {self.scale_tolerance}")
+        
+        # 3. Reload Session Data relative to new dir
+        self.refresh_file_list()
+        # Clear previous detections as they correspond to old type?
+        # Maybe keep them? User might switch back? 
+        # Better to clear to avoid saving Placement components into Schematic Logic.
+        self.matched_instances = [] 
+        self.detected_matches = []
+        
+        # Reset visual components
+        self.confirmed_rect = None
+
+    def refresh_file_list(self):
+        """ Refreshes list of existing templates in current output_dir """
+        self.existing_files = set()
+        if self.output_dir and os.path.exists(self.output_dir):
+            for f in os.listdir(self.output_dir):
+                if f.endswith(".png"):
+                    name = Path(f).stem
+                    if name == "dot": name = "."
+                    if name == "slash": name = "/"
+                    self.existing_files.add(name)
+
+    def update_view_fit(self):
+         # Calc Zoom-to-Fit for current original_page_img
+        if self.original_page_img is not None:
+            ph, pw = self.original_page_img.shape[:2]
+            view_w = 800 
+            view_h = 900 - self.header_height
+            scale_w = view_w / pw
+            scale_h = view_h / ph
+            self.min_scale = min(scale_w, scale_h) * 0.95 
+            self.view_scale = self.min_scale 
+            self.view_offset_x = (view_w - pw * self.view_scale) / 2
+            self.view_offset_y = (view_h - ph * self.view_scale) / 2
+            
+            # Reset viewports
+            self.right_view_scale = self.min_scale
+            self.right_view_offset_x = (view_w - pw * self.right_view_scale) / 2
+            self.right_view_offset_y = (view_h - ph * self.right_view_scale) / 2
         
     def compose_ui(self):
         view_w = 800
@@ -1309,15 +1847,29 @@ class TemplateTrainer:
             draw_head_btn("PREV_PAGE", sx + 10, 10, 80, 40, "< PREV")
             draw_head_btn("NEXT_PAGE", sx + 100, 10, 80, 40, "NEXT >")
             
+            # Disable interaction with these buttons if cropped
+            if self.page_crop_rect:
+                # We can't easily prevent click visually unless we dim them
+                # But we can just draw a semi-transparent overlay or text
+                # Simple hack: draw semi-transparent box over them? No, just text.
+                pass 
+                
             p_info = f"Page {self.current_page + 1}/{self.total_pages}"
             cv2.putText(self.canvas, p_info, (sx + 200, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.colors['text'], 1)
             
             if self.confirmed_rect:
-                instr = "Type Character. Press TAB to Rotate. Drag new box to discard."
-                col = self.colors['accent']
+                if self.selection_mode == "CROP":
+                     instr = "Press CONFIRM CROP to isolate area."
+                     col = self.colors['accent']
+                else:
+                    instr = "Type Character. Press TAB to Rotate. Drag new box to discard."
+                    col = self.colors['accent']
             elif self.selection_start:
                  instr = "Release to Confirm"
                  col = (0, 200, 0)
+            elif self.selection_mode == "CROP":
+                instr = "Drag Box to define region (Schematic/Placement). Remove outside noise."
+                col = (50, 200, 255)
             else:
                 instr = "Drag Left-Mouse to Select. Right-Mouse to Pan. Wheel to Zoom."
                 col = self.colors['text_dim']
@@ -1402,10 +1954,16 @@ class TemplateTrainer:
         if self.pdf_doc:
             try:
                 base_zoom = 8.0
-                pdf_x0 = rx / base_zoom
-                pdf_y0 = ry / base_zoom
-                pdf_x1 = (rx + rw) / base_zoom
-                pdf_y1 = (ry + rh) / base_zoom
+                
+                # Offset by crop if exists
+                crop_x, crop_y = 0, 0
+                if self.page_crop_rect:
+                    crop_x, crop_y = self.page_crop_rect[:2]
+                
+                pdf_x0 = (rx + crop_x) / base_zoom
+                pdf_y0 = (ry + crop_y) / base_zoom
+                pdf_x1 = (rx + rw + crop_x) / base_zoom
+                pdf_y1 = (ry + rh + crop_y) / base_zoom
                 
                 capture_zoom = 24.0
                 final_crop = render_clip(self.pdf_doc, self.current_page, (pdf_x0, pdf_y0, pdf_x1, pdf_y1), zoom=capture_zoom)
@@ -1433,6 +1991,28 @@ class TemplateTrainer:
             
             # Crop to content (remove whitespace)
             final_crop = self.crop_to_content(final_crop)
+
+            # Safeguard: Do not save if it's unreasonably large (likely a full page accident)
+            # e.g., > 1000px dimension
+            fh, fw = final_crop.shape[:2]
+            if fh > 1000 or fw > 1000:
+                 print(f"Error: Template too large ({fw}x{fh}). Likely full page selected. Discarding.")
+                 import tkinter as tk
+                 from tkinter import messagebox
+                 root = tk.Tk(); root.withdraw()
+                 messagebox.showerror("Template Too Large", f"The selected template is {fw}x{fh} pixels.\nThis is likely a mistake (full page selected).\nPlease select a smaller region containing only the character.")
+                 root.destroy()
+                 self.confirmed_rect = None
+                 return
+
+            if self.output_dir is None:
+                 print("Error: No template mode selected!")
+                 import tkinter as tk
+                 from tkinter import messagebox
+                 root = tk.Tk(); root.withdraw()
+                 messagebox.showwarning("Select Mode", "Please select 'Placement' or 'Schematics' mode first!")
+                 root.destroy()
+                 return
 
             gray = cv2.cvtColor(final_crop, cv2.COLOR_BGR2GRAY)
             
@@ -1484,12 +2064,35 @@ class TemplateTrainer:
             
             elif key == 13: # Enter
                 if self.confirmed_rect:
-                    # Confirm Label
-                    if len(self.input_char) > 0:
-                        self.save_template(self.input_char)
-            
-            elif key == 8: # Backspace
-                self.input_char = self.input_char[:-1]
+                    if self.selection_mode == "CROP":
+                        # If in CROP mode, ENTER confirms the crop
+                        rx, ry, rw, rh = self.confirmed_rect
+                        # Validate bounds
+                        ph, pw = self.full_page_img.shape[:2]
+                        rx = max(0, min(rx, pw))
+                        ry = max(0, min(ry, ph))
+                        rw = min(rw, pw - rx)
+                        rh = min(rh, ph - ry)
+                        
+                        self.page_crop_rect = (rx, ry, rw, rh)
+                        self.confirmed_rect = None
+                        self.input_char = ""
+                        self.selection_mode = "RECT" # Switch to template mode
+                        self.refresh_page_image()    # Slice the image and fit view
+                        print(f"Page cropped to: {self.page_crop_rect}")
+                        
+                        # Auto-Detect existing templates on the new crop
+                        if self.existing_files:
+                            print(f"Auto-detecting {len(self.existing_files)} templates on crop...")
+                            # Use the batch detection method if possible, or loop
+                            # Since detect_session_templates uses process_page_system which is heavy-handed (reloads TM), 
+                            # let's just loop search_single_char which is lighter and uses current memory
+                            for char_key in self.existing_files:
+                                self.search_single_char(char_key)
+                    else:
+                        # Confirm Label for normal template selection
+                        if len(self.input_char) > 0:
+                            self.save_template(self.input_char)
                 
             elif key == 9: # TAB
                 if self.confirmed_rect:
@@ -1508,8 +2111,9 @@ class TemplateTrainer:
                     self.input_char = char 
             
             else:
-                if key == ord('n'): self.change_page(1)
-                if key == ord('b'): self.change_page(-1)
+                if not self.page_crop_rect:
+                    if key == ord('n'): self.change_page(1)
+                    if key == ord('b'): self.change_page(-1)
 
         cv2.destroyAllWindows()
 
@@ -1583,20 +2187,9 @@ if __name__ == "__main__":
     if args.debug_page is not None:
         debug_page_idx = args.debug_page - 1
     
-    while True:
-        mode = ask_template_mode()
+    app = TemplateTrainer(debug_page=debug_page_idx)
+    
+    if initial_pdf:
+        app.load_pdf(initial_pdf)
         
-        if mode == "exit" or not mode:
-            print("Exiting...")
-            break
-            
-        print(f"Starting in mode: {mode}")
-        
-        app = TemplateTrainer(output_dir=mode, debug_page=debug_page_idx)
-        
-        if initial_pdf:
-            app.load_pdf(initial_pdf)
-            initial_pdf = None # Only load once on first run
-            
-        app.run()
-        print("Session finished. Returning to start screen...")
+    app.run()
