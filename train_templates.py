@@ -1,4 +1,4 @@
-﻿import argparse
+import argparse
 import os
 import sys
 import string
@@ -739,8 +739,8 @@ class TemplateTrainer:
                    cv2.rectangle(vis_cand, (x, y), (x+w, y+h), (0, 0, 255), 1)
                 
                 debug_path = f"debug_candidates_page_{self.current_page + 1}.png"
-                # cv2.imwrite(debug_path, vis_cand)
-                # print(f"Saved candidate debug visualization to {debug_path}")
+                cv2.imwrite(debug_path, vis_cand)
+                print(f"Saved candidate debug visualization to {debug_path}")
 
              except Exception as e:
                 print(f"Error computing candidates: {e}")
